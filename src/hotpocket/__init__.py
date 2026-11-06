@@ -1,4 +1,4 @@
-"""claude-gateway: one Claude Code endpoint for the team, backed by a pool of
+"""hotpocket: one Claude Code endpoint for the team, backed by a pool of
 Claude accounts.
 
 Each request goes to the account with the most headroom (a session stays on
@@ -7,18 +7,18 @@ request is retried on the next account before the developer sees anything.
 Account tokens never leave the gateway; developers get their own keys.
 
 Server
-  claude-gateway serve                 listens on CLAUDE_GATEWAY_HOST:CLAUDE_GATEWAY_PORT
+  hotpocket serve                 listens on HOTPOCKET_HOST:HOTPOCKET_PORT
                                        (default 127.0.0.1:8080)
 
 Admin (run on the gateway host)
-  claude-gateway account add LABEL     token on stdin (from `claude setup-token`)
-  claude-gateway account import        `label=token` lines on stdin
-  claude-gateway account rm LABEL
-  claude-gateway account list
-  claude-gateway key add NAME          create a developer key (shown once)
-  claude-gateway key rm NAME
-  claude-gateway key list
-  claude-gateway status                accounts, usage and developers
+  hotpocket account add LABEL     token on stdin (from `claude setup-token`)
+  hotpocket account import        `label=token` lines on stdin
+  hotpocket account rm LABEL
+  hotpocket account list
+  hotpocket key add NAME          create a developer key (shown once)
+  hotpocket key rm NAME
+  hotpocket key list
+  hotpocket status                accounts, usage and developers
 
 Developers point Claude Code at it (e.g. in ~/.claude/settings.json "env"):
   ANTHROPIC_BASE_URL=https://<gateway host>
@@ -44,13 +44,13 @@ import aiohttp
 from aiohttp import web
 from yarl import URL
 
-DATA = Path(os.environ.get("CLAUDE_GATEWAY_DATA", "/var/lib/claude-gateway"))
+DATA = Path(os.environ.get("HOTPOCKET_DATA", "/var/lib/hotpocket"))
 ACCOUNTS = DATA / "accounts.json"   # {label: token}, in priority order
 KEYS = DATA / "keys.json"           # {developer name: key}
 STATE = DATA / "state.json"         # usage and blocks, survives restarts
-UPSTREAM = os.environ.get("CLAUDE_GATEWAY_UPSTREAM", "https://api.anthropic.com").rstrip("/")
-HOST = os.environ.get("CLAUDE_GATEWAY_HOST", "127.0.0.1")
-PORT = int(os.environ.get("CLAUDE_GATEWAY_PORT", "8080"))
+UPSTREAM = os.environ.get("HOTPOCKET_UPSTREAM", "https://api.anthropic.com").rstrip("/")
+HOST = os.environ.get("HOTPOCKET_HOST", "127.0.0.1")
+PORT = int(os.environ.get("HOTPOCKET_PORT", "8080"))
 
 OAUTH_BETA = "oauth-2025-04-20"
 UNIFIED = "anthropic-ratelimit-unified-"
@@ -191,7 +191,7 @@ class Pool:
         self._acct(label).update(blocked_kind=kind, blocked_until=until, blocked_claim=claim,
                                  blocked_token=fingerprint(token))
         self.dirty = True
-        hint = "; replace it with `claude-gateway account add`" if kind == "auth" else ""
+        hint = "; replace it with `hotpocket account add`" if kind == "auth" else ""
         log(f"account {label}: {REASONS[kind]}{hint}; back in {until_text(until)}")
 
     def served(self, label, dev):
@@ -276,12 +276,12 @@ async def proxy(request):
         who = request.headers.get("tailscale-user-login") or request.remote
         log(f"refused {request.method} {request.path} from {who}: missing or unknown developer key")
         # The gateway never sends 401: Claude Code retries a 401 for minutes before giving up.
-        return api_error(403, "permission_error", "claude-gateway: missing or unknown developer key. "
+        return api_error(403, "permission_error", "hotpocket: missing or unknown developer key. "
                          "Set ANTHROPIC_AUTH_TOKEN to the key your admin gave you.")
     tag = f"{dev} {request.method} {request.path}"
     accounts = ACCOUNT_FILE.get()
     if not accounts:
-        return api_error(503, "api_error", "claude-gateway: no accounts configured.")
+        return api_error(503, "api_error", "hotpocket: no accounts configured.")
     body = await request.read()  # buffered so the request can be resent on another account
     session = request.headers.get("x-claude-code-session-id") or f"dev:{dev}"
     headers = upstream_headers(request.headers)
@@ -297,7 +297,7 @@ async def proxy(request):
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log(f"{tag} -> {label}: upstream error {e!r}")
             return api_error(502, "api_error",
-                             f"claude-gateway: could not reach the Anthropic API ({type(e).__name__}).")
+                             f"hotpocket: could not reach the Anthropic API ({type(e).__name__}).")
         async with resp:
             POOL.observe(label, resp.headers)
             if resp.status in (401, 429):
@@ -344,19 +344,19 @@ def all_blocked(tag, accounts):
     log(f"{tag}: all {len(blocks)} accounts blocked ({', '.join(sorted(map(str, kinds)))}); "
         f"first back in {until_text(reset)}")
     if kinds == {"auth"}:
-        return api_error(403, "permission_error", "claude-gateway: every team account token was "
+        return api_error(403, "permission_error", "hotpocket: every team account token was "
                          "rejected. Ask your admin to replace them.")
     if "limit" in kinds:
         # Shaped like a subscription usage limit so Claude Code shows its normal
         # "limit reached, resets at ..." message (and can wait for the reset).
         claim = next((b["blocked_claim"] for b in blocks if b.get("blocked_claim")), "five_hour")
         return api_error(429, "rate_limit_error",
-                         f"claude-gateway: all {len(blocks)} team accounts are at their usage limit "
+                         f"hotpocket: all {len(blocks)} team accounts are at their usage limit "
                          f"or unavailable. The first one is back in {until_text(reset)}.",
                          headers={UNIFIED + "status": "rejected", UNIFIED + "reset": str(int(reset)),
                                   UNIFIED + "representative-claim": claim, **retry})
     return api_error(429, "rate_limit_error",
-                     f"claude-gateway: all team accounts are briefly throttled. Retry in {until_text(reset)}.",
+                     f"hotpocket: all team accounts are briefly throttled. Retry in {until_text(reset)}.",
                      headers=retry)
 
 
@@ -398,7 +398,7 @@ def render_html(snap):
                    for d in snap["developers"]) or '<tr><td colspan="4">No requests yet</td></tr>'
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="30">
-<title>Claude gateway</title><style>
+<title>hotpocket</title><style>
 :root{{--bg:#fff;--fg:#1d1d1f;--mute:#6e6e73;--line:#e5e5ea;--ok:#1a7f37;--bad:#b42318}}
 @media (prefers-color-scheme:dark){{:root{{--bg:#111;--fg:#f2f2f2;--mute:#a1a1a6;--line:#2c2c2e;--ok:#4ac26b;--bad:#ff6b5e}}}}
 body{{background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;margin:0;padding:24px 16px;max-width:960px;margin:auto}}
@@ -407,7 +407,7 @@ h1{{font-size:20px;margin:0 0 4px}}h2{{font-size:16px;margin:28px 0 8px}}p{{colo
 th,td{{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}}
 th{{color:var(--mute);font-weight:500;font-size:13px}}.ok{{color:var(--ok)}}.bad{{color:var(--bad)}}
 </style></head><body>
-<h1>Claude gateway</h1><p>{snap['available']} of {len(snap['accounts'])} accounts ready · refreshes every 30s</p>
+<h1>hotpocket</h1><p>{snap['available']} of {len(snap['accounts'])} accounts ready · refreshes every 30s</p>
 <h2>Accounts</h2><div class="wrap"><table><tr><th>Account</th><th>State</th><th>5h used</th><th>5h resets</th>
 <th>7d used</th><th>7d resets</th><th>Active sessions</th><th>Requests</th></tr>{''.join(rows)}</table></div>
 <h2>Developers</h2><div class="wrap"><table><tr><th>Name</th><th>Requests</th><th>Last seen</th><th>Last account</th></tr>{devs}</table></div>
@@ -424,7 +424,7 @@ for (const t of document.querySelectorAll('time')) {{
 def serve(argv):
     global POOL
     if argv:
-        die("`serve` takes no arguments; set CLAUDE_GATEWAY_HOST and CLAUDE_GATEWAY_PORT instead.")
+        die("`serve` takes no arguments; set HOTPOCKET_HOST and HOTPOCKET_PORT instead.")
     POOL = Pool()
 
     async def ticker():
@@ -519,16 +519,16 @@ def cmd_account(argv):
         for label, token in accounts.items():
             print(f"{label:20} {token[:14]}…{token[-4:]}")
         if not accounts:
-            print("No accounts. Add one with: claude-gateway account add LABEL")
+            print("No accounts. Add one with: hotpocket account add LABEL")
     else:
-        die("Usage: claude-gateway account add LABEL | import | rm LABEL | list")
+        die("Usage: hotpocket account add LABEL | import | rm LABEL | list")
 
 
 def cmd_key(argv):
     sub, args = (argv[0], argv[1:]) if argv else ("list", [])
     keys = read_json(KEYS, {})
     if sub == "add" and len(args) == 1 and LABEL_RE.fullmatch(args[0]):
-        keys[args[0]] = "cgw-" + secrets.token_urlsafe(24)
+        keys[args[0]] = "hp-" + secrets.token_urlsafe(24)
         write_json(KEYS, keys)
         print(keys[args[0]])
         print(f"Key for '{args[0]}' (shown once; `key add` again to replace it).", file=sys.stderr)
@@ -536,9 +536,9 @@ def cmd_key(argv):
         remove(KEYS, args[0], "developer key")
         print(f"Removed key for '{args[0]}'. Their requests are refused from now on.")
     elif sub == "list":
-        print("\n".join(keys) or "No developer keys. Create one with: claude-gateway key add NAME")
+        print("\n".join(keys) or "No developer keys. Create one with: hotpocket key add NAME")
     else:
-        die("Usage: claude-gateway key add NAME | rm NAME | list")
+        die("Usage: hotpocket key add NAME | rm NAME | list")
 
 
 def cmd_status(_argv):
@@ -546,7 +546,7 @@ def cmd_status(_argv):
         with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/_gateway/status", timeout=5) as r:
             snap = json.load(r)
     except OSError as e:
-        die(f"Gateway isn't answering on port {PORT} ({e}). Check: systemctl status claude-gateway")
+        die(f"Gateway isn't answering on port {PORT} ({e}). Check: systemctl status hotpocket")
     rows = [("ACCOUNT", "STATE", "5H", "5H RESET", "7D", "7D RESET", "SESSIONS", "REQUESTS")]
     for a in snap["accounts"]:
         state = "ready" if a["available"] else f"{a['blocked_reason']} ({until_text(a['blocked_until'])})"

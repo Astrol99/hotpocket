@@ -1,10 +1,10 @@
-"""End-to-end tests for claude-gateway against a fake Anthropic API. Run: uv run tests/test_gateway.py"""
+"""End-to-end tests for hotpocket against a fake Anthropic API. Run: uv run tests/test_gateway.py"""
 import http.client, json, os, subprocess, sys, tempfile, time
 from pathlib import Path
 HERE = Path(__file__).resolve().parent
-GW = [sys.executable, "-m", "claude_gateway"]  # the installed package (uv run installs it)
+GW = [sys.executable, "-m", "hotpocket"]  # the installed package (uv run installs it)
 G = tempfile.mkdtemp(prefix="gw-test-")
-env = dict(os.environ, CLAUDE_GATEWAY_DATA=f"{G}/data", CLAUDE_GATEWAY_UPSTREAM="http://127.0.0.1:18901", CLAUDE_GATEWAY_PORT="18900")
+env = dict(os.environ, HOTPOCKET_DATA=f"{G}/data", HOTPOCKET_UPSTREAM="http://127.0.0.1:18901", HOTPOCKET_PORT="18900")
 results = []
 
 
@@ -51,7 +51,7 @@ ok(rc == 0, f"account import: {out}")
 rc, bad = cli("account", "import", stdin="x=sk-ant-oat01-X\noops=nope\n")
 ok(rc != 0 and "nothing was imported" in bad, "bad import rejected")
 rc, key = cli("key", "add", "alice"); key = key.splitlines()[0]
-ok(key.startswith("cgw-"), "key add")
+ok(key.startswith("hp-"), "key add")
 modes = oct(os.stat(f"{G}/data/accounts.json").st_mode & 0o777), oct(os.stat(f"{G}/data/keys.json").st_mode & 0o777)
 ok(modes == ("0o600", "0o600"), f"secret files are 0600 {modes}")
 rc, out = cli("serve", "--port", "1")
@@ -68,7 +68,7 @@ H = {"authorization": f"Bearer {key}", "anthropic-beta": "claude-code-20250219,i
 ok(get("/api/hello", "HEAD")[0].status == 200, "keyless HEAD /api/hello connectivity check answered locally")
 r, body, *_ = call({"content-type": "application/json"})
 ok(r.status == 403 and b"developer key" in body, "no key -> 403")
-r, body, *_ = call(dict(H, authorization="Bearer cgw-wrong"))
+r, body, *_ = call(dict(H, authorization="Bearer hp-wrong"))
 ok(r.status == 403, "wrong key -> 403")
 
 n0 = len(seen())

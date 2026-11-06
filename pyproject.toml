@@ -1,16 +1,14 @@
 [project]
 name = "hotpocket"
-version = "0.2.0"
+version = "0.3.0"
 description = "One Claude Code endpoint for a team, backed by a pool of Claude accounts"
 requires-python = ">=3.10"
 dependencies = ["aiohttp>=3.9"]
 
 [project.scripts]
-claude-gateway = "claude_gateway:main"
+hotpocket = "hotpocket:main"
 
 [build-system]
 requires = ["uv_build>=0.11.3,<0.12"]
 build-backend = "uv_build"
 
-[tool.uv.build-backend]
-module-name = "claude_gateway"

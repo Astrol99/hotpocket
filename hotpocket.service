@@ -2,9 +2,9 @@
 Description=Claude Code team gateway
 
 [Service]
-User=claude-gateway
-ExecStart=/opt/claude-gateway/.venv/bin/claude-gateway serve
-StateDirectory=claude-gateway
+User=hotpocket
+ExecStart=/opt/hotpocket/.venv/bin/hotpocket serve
+StateDirectory=hotpocket
 StateDirectoryMode=0700
 Restart=always
 RestartSec=2

@@ -1,12 +1,12 @@
 #!/bin/sh
-# Create or update the claude-gateway incus container.
+# Create or update the hotpocket incus container.
 # Run it on the incus host itself, or from another machine with HOST=<ssh host>.
 # Safe to re-run: every step skips work that is already done. Account tokens
 # and developer keys in the container are never touched.
 set -eu
 
 HOST="${HOST:-local}"
-NAME="${NAME:-claude-gateway}"
+NAME="${NAME:-hotpocket}"
 DIR=$(cd "$(dirname "$0")" && pwd)
 
 if [ "$HOST" = local ]; then
@@ -32,11 +32,11 @@ until in_ct getent hosts pkgs.tailscale.com >/dev/null 2>&1; do
   sleep 2
 done
 
-in_ct rm -rf /opt/claude-gateway/src
-in_ct mkdir -p /opt/claude-gateway
-tar -C "$DIR" --exclude=__pycache__ -cf - pyproject.toml uv.lock src setup.sh claude-gateway.service hardening.conf |
-  in_ct tar -C /opt/claude-gateway --no-same-owner -xf -
-in_ct sh /opt/claude-gateway/setup.sh
+in_ct rm -rf /opt/hotpocket/src
+in_ct mkdir -p /opt/hotpocket
+tar -C "$DIR" --exclude=__pycache__ -cf - pyproject.toml uv.lock src setup.sh hotpocket.service hardening.conf |
+  in_ct tar -C /opt/hotpocket --no-same-owner -xf -
+in_ct sh /opt/hotpocket/setup.sh
 
 if in_ct tailscale status >/dev/null 2>&1; then
   echo "==> Tailscale: $(in_ct tailscale serve status | head -1)"

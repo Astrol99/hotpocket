@@ -20,8 +20,8 @@ limits or accounts.
 - **Everyone limited.** If every account is out, Claude Code shows its normal
   "limit reached" message with the time of the earliest reset.
 
-The gateway runs in its own incus container (`claude-gateway`) and is reachable
-only over Tailscale at `https://claude-gateway.<your-tailnet>.ts.net`.
+The gateway runs in its own incus container (`hotpocket`) and is reachable
+only over Tailscale at `https://hotpocket.<your-tailnet>.ts.net`.
 
 **Requirements:** an incus host, Tailscale, and one long-lived token per account
 from `claude setup-token`. The gateway is a small Python 3.10+ package built on
@@ -35,8 +35,8 @@ Add this to `~/.claude/settings.json`, using the key your admin gives you:
 ```json
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "https://claude-gateway.<your-tailnet>.ts.net",
-    "ANTHROPIC_AUTH_TOKEN": "cgw-..."
+    "ANTHROPIC_BASE_URL": "https://hotpocket.<your-tailnet>.ts.net",
+    "ANTHROPIC_AUTH_TOKEN": "hp-..."
   }
 }
 ```
@@ -69,24 +69,24 @@ prints in a browser signed in to claude.ai as that account. Then save the token
 it prints:
 
 ```sh
-incus exec claude-gateway -- claude-gateway account add dev     # paste the token (hidden)
+incus exec hotpocket -- hotpocket account add dev     # paste the token (hidden)
 ```
 
 To add several at once, pipe `label=token` lines into
-`claude-gateway account import`.
+`hotpocket account import`.
 
 Developer keys:
 
 ```sh
-incus exec claude-gateway -- claude-gateway key add alice    # prints the key once
-incus exec claude-gateway -- claude-gateway key rm alice     # revoke
+incus exec hotpocket -- hotpocket key add alice    # prints the key once
+incus exec hotpocket -- hotpocket key rm alice     # revoke
 ```
 
-Status: open `https://claude-gateway.<your-tailnet>.ts.net/_gateway` in a browser, or:
+Status: open `https://hotpocket.<your-tailnet>.ts.net/_gateway` in a browser, or:
 
 ```sh
-incus exec claude-gateway -- claude-gateway status
-incus exec claude-gateway -- journalctl -u claude-gateway -f    # request log
+incus exec hotpocket -- hotpocket status
+incus exec hotpocket -- journalctl -u hotpocket -f    # request log
 ```
 
 Changes to accounts and keys apply immediately, with no restart. Accounts are
@@ -96,25 +96,25 @@ tried in the order you added them when usage is tied.
 
 ```sh
 uv run tests/test_gateway.py                    # end-to-end tests
-CLAUDE_GATEWAY_DATA=./data uv run claude-gateway serve   # run it locally
+HOTPOCKET_DATA=./data uv run hotpocket serve   # run it locally
 ```
 
 The tests run the gateway against a fake Anthropic API, so they need no real
-tokens. Settings are environment variables: `CLAUDE_GATEWAY_DATA` (default
-`/var/lib/claude-gateway`), `CLAUDE_GATEWAY_HOST` (default `127.0.0.1`) and
-`CLAUDE_GATEWAY_PORT` (default `8080`).
+tokens. Settings are environment variables: `HOTPOCKET_DATA` (default
+`/var/lib/hotpocket`), `HOTPOCKET_HOST` (default `127.0.0.1`) and
+`HOTPOCKET_PORT` (default `8080`).
 
 ## Notes
 
 - Tokens from `claude setup-token` last a year. If one is revoked, the gateway
   skips it, logs `token rejected (401)`, and the status page shows it. Replace
   it with `account add`; the new token is used right away.
-- In the Tailscale admin console, turn off key expiry for the `claude-gateway`
+- In the Tailscale admin console, turn off key expiry for the `hotpocket`
   machine so it doesn't drop off the tailnet after 180 days.
-- Files in the container: `/opt/claude-gateway/` (code and its `.venv`, with
-  `claude-gateway` linked into `/usr/local/bin`) and `/var/lib/claude-gateway/`
+- Files in the container: `/opt/hotpocket/` (code and its `.venv`, with
+  `hotpocket` linked into `/usr/local/bin`) and `/var/lib/hotpocket/`
   (`accounts.json`, `keys.json`, `state.json`, all `0600`). The service runs as
-  the unprivileged `claude-gateway` user.
+  the unprivileged `hotpocket` user.
 - `deploy.sh` creates the container if needed, copies the code in, and runs
   `setup.sh` inside it. Every step skips work that is already done, so a failed
   run can just be run again.
