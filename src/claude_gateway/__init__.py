@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """claude-gateway: one Claude Code endpoint for the team, backed by a pool of
 Claude accounts.
 
@@ -25,28 +24,28 @@ Developers point Claude Code at it (e.g. in ~/.claude/settings.json "env"):
   ANTHROPIC_AUTH_TOKEN=<developer key>
 """
 
+import asyncio
 import getpass
 import hmac
 import html
-import http.client
-import http.server
 import json
 import os
 import re
 import secrets
-import signal
 import sys
-import threading
 import time
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlsplit
+
+import aiohttp
+from aiohttp import web
+from yarl import URL
 
 DATA = Path(os.environ.get("CLAUDE_GATEWAY_DATA", "/var/lib/claude-gateway"))
 ACCOUNTS = DATA / "accounts.json"   # {label: token}, in priority order
 KEYS = DATA / "keys.json"           # {developer name: key}
 STATE = DATA / "state.json"         # usage and blocks, survives restarts
-UPSTREAM = urlsplit(os.environ.get("CLAUDE_GATEWAY_UPSTREAM", "https://api.anthropic.com"))
+UPSTREAM = os.environ.get("CLAUDE_GATEWAY_UPSTREAM", "https://api.anthropic.com").rstrip("/")
 DEFAULT_PORT = int(os.environ.get("CLAUDE_GATEWAY_PORT", "8080"))
 
 OAUTH_BETA = "oauth-2025-04-20"
@@ -105,20 +104,19 @@ class Watched:
 
     def __init__(self, path):
         self.path, self.mtime, self.data = path, None, {}
-        self.lock = threading.Lock()
 
     def get(self):
         try:
             mtime = self.path.stat().st_mtime_ns
         except FileNotFoundError:
             mtime = None
-        with self.lock:
-            if mtime != self.mtime:
-                self.data, self.mtime = read_json(self.path, {}), mtime
-            return self.data
+        if mtime != self.mtime:
+            self.data, self.mtime = read_json(self.path, {}), mtime
+        return self.data
 
 
 # --------------------------------------------------------------------------- pool
+# Everything below runs on the event loop's single thread, so no locks are needed.
 
 class Pool:
     def __init__(self):
@@ -126,7 +124,6 @@ class Pool:
         self.accounts = saved.get("accounts", {})
         self.devs = saved.get("devs", {})
         self.sessions = {}
-        self.lock = threading.Lock()
         self.dirty = False
 
     def _acct(self, label):
@@ -141,112 +138,102 @@ class Pool:
 
     def choose(self, labels, session, exclude):
         now = time.time()
-        with self.lock:
-            ready = [l for l in labels
-                     if l not in exclude and self._acct(l).get("blocked_until", 0) <= now]
-            if not ready:
-                return None
-            sticky = self.sessions.get(session, (None, 0))[0]
-            if sticky in ready and self._util(sticky) < STICKY_MAX_UTIL:
-                choice = sticky
-            else:
-                choice = min(ready, key=lambda l: (self._util(l), labels.index(l)))
-            self.sessions[session] = (choice, now)
-            if len(self.sessions) > 5000:
-                self.sessions = {s: v for s, v in self.sessions.items() if v[1] > now - SESSION_TTL}
-            return choice
+        ready = [l for l in labels
+                 if l not in exclude and self._acct(l).get("blocked_until", 0) <= now]
+        if not ready:
+            return None
+        sticky = self.sessions.get(session, (None, 0))[0]
+        if sticky in ready and self._util(sticky) < STICKY_MAX_UTIL:
+            choice = sticky
+        else:
+            choice = min(ready, key=lambda l: (self._util(l), labels.index(l)))
+        self.sessions[session] = (choice, now)
+        if len(self.sessions) > 5000:
+            self.sessions = {s: v for s, v in self.sessions.items() if v[1] > now - SESSION_TTL}
+        return choice
 
     def observe(self, label, headers):
         """Record the account's live usage from the API's response headers."""
         if not any(k.startswith(UNIFIED) for k in headers):
             return
-        with self.lock:
-            a = self._acct(label)
-            for key, name in (("u5", "5h-utilization"), ("u7", "7d-utilization"),
-                              ("r5", "5h-reset"), ("r7", "7d-reset")):
-                try:
-                    a[key] = float(headers[UNIFIED + name])
-                except (KeyError, ValueError):
-                    pass
-            a["status"] = headers.get(UNIFIED + "status", a.get("status"))
-            a["seen"] = time.time()
-            self.dirty = True
+        a = self._acct(label)
+        for key, name in (("u5", "5h-utilization"), ("u7", "7d-utilization"),
+                          ("r5", "5h-reset"), ("r7", "7d-reset")):
+            try:
+                a[key] = float(headers[UNIFIED + name])
+            except (KeyError, ValueError):
+                pass
+        a["status"] = headers.get(UNIFIED + "status", a.get("status"))
+        a["seen"] = time.time()
+        self.dirty = True
 
     def block(self, label, until, reason):
-        with self.lock:
-            a = self._acct(label)
-            a["blocked_until"], a["blocked_reason"] = until, reason
-            self.dirty = True
+        a = self._acct(label)
+        a["blocked_until"], a["blocked_reason"] = until, reason
+        self.dirty = True
         log(f"account {label}: {reason}; back in {until_text(until)}")
 
     def served(self, label, dev):
         now = time.time()
-        with self.lock:
-            a = self._acct(label)
-            a["requests"] = a.get("requests", 0) + 1
-            a["last_used"] = now
-            d = self.devs.setdefault(dev, {"requests": 0})
-            d["requests"] += 1
-            d["last_seen"], d["last_account"] = now, label
-            self.dirty = True
+        a = self._acct(label)
+        a["requests"] = a.get("requests", 0) + 1
+        a["last_used"] = now
+        d = self.devs.setdefault(dev, {"requests": 0})
+        d["requests"] += 1
+        d["last_seen"], d["last_account"] = now, label
+        self.dirty = True
 
     def earliest_reset(self, labels):
-        with self.lock:
-            times = [self.accounts.get(l, {}).get("blocked_until", 0) for l in labels]
+        times = [self.accounts.get(l, {}).get("blocked_until", 0) for l in labels]
         times = [t for t in times if t > time.time()]
         return min(times) if times else None
 
     def snapshot(self, labels):
         now = time.time()
-        with self.lock:
-            active = {}
-            for label, seen in self.sessions.values():
-                if seen > now - 3600:
-                    active[label] = active.get(label, 0) + 1
-            accounts = []
-            for l in labels:
-                a = self.accounts.get(l, {})
-                blocked = a.get("blocked_until", 0) > now
-                accounts.append({
-                    "label": l, "available": not blocked,
-                    "blocked_until": a.get("blocked_until") if blocked else None,
-                    "blocked_reason": a.get("blocked_reason") if blocked else None,
-                    "five_hour": a.get("u5"), "five_hour_reset": a.get("r5"),
-                    "seven_day": a.get("u7"), "seven_day_reset": a.get("r7"),
-                    "requests": a.get("requests", 0), "last_used": a.get("last_used"),
-                    "active_sessions": active.get(l, 0),
-                })
-            devs = [{"name": n, **d} for n, d in sorted(self.devs.items())]
+        active = {}
+        for label, seen in self.sessions.values():
+            if seen > now - 3600:
+                active[label] = active.get(label, 0) + 1
+        accounts = []
+        for l in labels:
+            a = self.accounts.get(l, {})
+            blocked = a.get("blocked_until", 0) > now
+            accounts.append({
+                "label": l, "available": not blocked,
+                "blocked_until": a.get("blocked_until") if blocked else None,
+                "blocked_reason": a.get("blocked_reason") if blocked else None,
+                "five_hour": a.get("u5"), "five_hour_reset": a.get("r5"),
+                "seven_day": a.get("u7"), "seven_day_reset": a.get("r7"),
+                "requests": a.get("requests", 0), "last_used": a.get("last_used"),
+                "active_sessions": active.get(l, 0),
+            })
+        devs = [{"name": n, **d} for n, d in sorted(self.devs.items())]
         return {"now": now, "accounts": accounts, "developers": devs,
                 "available": sum(a["available"] for a in accounts)}
 
     def persist(self):
-        with self.lock:
-            if not self.dirty:
-                return
-            data = json.loads(json.dumps({"accounts": self.accounts, "devs": self.devs}))
+        if self.dirty:
             self.dirty = False
-        write_json(STATE, data)
+            write_json(STATE, {"accounts": self.accounts, "devs": self.devs})
 
 
 ACCOUNT_FILE = Watched(ACCOUNTS)
 KEY_FILE = Watched(KEYS)
-POOL = None
+POOL: Pool = None
+CLIENT: aiohttp.ClientSession = None
 
 
 def reset_time(headers):
     """When a usage-limit rejection lifts, from the response headers."""
-    for name in (UNIFIED + "reset",):
-        try:
-            return float(headers[name])
-        except (KeyError, ValueError):
-            pass
-    windows = [(UNIFIED + "5h-status", UNIFIED + "5h-reset"), (UNIFIED + "7d-status", UNIFIED + "7d-reset")]
+    try:
+        return float(headers[UNIFIED + "reset"])
+    except (KeyError, ValueError):
+        pass
     resets = []
-    for status, reset in windows:
-        if headers.get(status) == "rejected":
+    for window in ("5h", "7d"):
+        if headers.get(f"{UNIFIED}{window}-status") == "rejected":
             try:
-                resets.append(float(headers[reset]))
+                resets.append(float(headers[f"{UNIFIED}{window}-reset"]))
             except (KeyError, ValueError):
                 pass
     if resets:
@@ -259,210 +246,137 @@ def reset_time(headers):
 
 # --------------------------------------------------------------------------- HTTP
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    server_version = "claude-gateway"
-    timeout = 900
+def api_error(status, etype, message, headers=None):
+    return web.json_response({"type": "error", "error": {"type": etype, "message": message}},
+                             status=status, headers=headers)
 
-    def log_message(self, *_):
-        pass
 
-    def do_GET(self):
-        self.dispatch()
+def developer(headers):
+    auth = headers.get("authorization", "")
+    presented = auth[7:].strip() if auth.lower().startswith("bearer ") \
+        else headers.get("x-api-key", "").strip()
+    if presented:
+        for name, key in KEY_FILE.get().items():
+            if hmac.compare_digest(presented.encode(), str(key).encode()):
+                return name
+    return None
 
-    do_POST = do_PUT = do_PATCH = do_DELETE = do_GET
 
-    def dispatch(self):
+def upstream_headers(headers):
+    out = {k: v for k, v in headers.items()
+           if k.lower() not in NOT_UPSTREAM and not k.lower().startswith(("tailscale-", "x-forwarded-"))}
+    betas = [b.strip() for v in headers.getall("anthropic-beta", []) for b in v.split(",")]
+    out["anthropic-beta"] = ",".join(dict.fromkeys([b for b in betas if b] + [OAUTH_BETA]))
+    return out
+
+
+async def handle(request):
+    path = request.path.rstrip("/")
+    if path in ("/_gateway", "/_gateway/status", "/_gateway/health"):
+        return gateway_page(path)
+    if path == "/api/hello":  # Claude Code's keyless connectivity check; answer like the API does
+        return web.json_response({"message": "hello"})
+    return await proxy(request)
+
+
+async def proxy(request):
+    started, method, path = time.time(), request.method, request.path
+    dev = developer(request.headers)
+    if dev is None:
+        who = request.headers.get("tailscale-user-login") or request.remote
+        log(f"refused {method} {path} from {who}: missing or unknown developer key")
+        # 403 rather than 401: Claude Code retries a 401 for minutes before giving up.
+        return api_error(403, "permission_error", "claude-gateway: missing or unknown developer key. "
+                         "Set ANTHROPIC_AUTH_TOKEN to the key your admin gave you.")
+    accounts = ACCOUNT_FILE.get()
+    labels = list(accounts)
+    if not labels:
+        return api_error(503, "api_error", "claude-gateway: no accounts configured.")
+    body = await request.read()  # buffered so the request can be resent on another account
+    session = request.headers.get("x-claude-code-session-id") or f"dev:{dev}"
+    headers = upstream_headers(request.headers)
+    url = URL(UPSTREAM + request.raw_path, encoded=True)
+    tried, last = [], None
+    while (label := POOL.choose(labels, session, tried)) is not None:
+        tried.append(label)
+        headers["authorization"] = f"Bearer {accounts[label]}"
         try:
-            path = self.path.split("?", 1)[0].rstrip("/")
-            if path in ("/_gateway", "/_gateway/status", "/_gateway/health"):
-                self.read_body()
-                return self.gateway_page(path)
-            self.proxy()
-        except (BrokenPipeError, ConnectionResetError):
-            self.close_connection = True  # the developer's side went away
-        except Exception as e:  # e.g. upstream dropped mid-stream; never take the server down
-            log(f"{self.command} {self.path.split('?', 1)[0]}: {e!r}")
-            self.close_connection = True
-
-    # ---- request plumbing
-
-    def read_body(self):
-        if "chunked" in self.headers.get("transfer-encoding", "").lower():
-            out = bytearray()
-            while True:
-                size = int(self.rfile.readline(65537).split(b";")[0].strip() or b"0", 16)
-                if size == 0:
-                    while self.rfile.readline(65537) not in (b"\r\n", b"\n", b""):
-                        pass
-                    return bytes(out)
-                if len(out) + size > MAX_BODY:
-                    raise ValueError("request body too large")
-                out += self.rfile.read(size)
-                self.rfile.readline()
-        n = int(self.headers.get("content-length") or 0)
-        if n > MAX_BODY:
-            raise ValueError("request body too large")
-        return self.rfile.read(n) if n else None
-
-    def developer(self):
-        auth = self.headers.get("authorization", "")
-        presented = auth[7:].strip() if auth.lower().startswith("bearer ") \
-            else self.headers.get("x-api-key", "").strip()
-        if presented:
-            for name, key in KEY_FILE.get().items():
-                if hmac.compare_digest(presented.encode(), str(key).encode()):
-                    return name
-        return None
-
-    def send_buffered(self, status, headers, data):
-        self.send_response(status)
-        for k, v in headers:
-            if k.lower() not in NOT_DOWNSTREAM:
-                self.send_header(k, v)
-        self.send_header("content-length", str(len(data)))
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(data)
-        self.wfile.flush()
-
-    def send_api_error(self, status, etype, message, headers=()):
-        body = json.dumps({"type": "error", "error": {"type": etype, "message": message}}).encode()
-        self.send_buffered(status, [("content-type", "application/json"), *headers], body)
-
-    def relay(self, resp):
-        """Stream the upstream response through as it arrives (SSE-friendly)."""
-        self.send_response(resp.status)
-        for k, v in resp.getheaders():
-            kl = k.lower()
-            # Per-account usage headers would make Claude Code warn about one
-            # account's limit while the pool still has room, so drop them.
-            if kl not in NOT_DOWNSTREAM and not kl.startswith(UNIFIED):
-                self.send_header(k, v)
-        if self.command == "HEAD" or resp.status in (204, 304):
-            self.send_header("content-length", "0")
-            self.end_headers()
-            resp.read()
-            return
-        self.send_header("transfer-encoding", "chunked")
-        self.end_headers()
-        while True:
-            chunk = resp.read1(65536)
-            if not chunk:
-                break
-            self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
-            self.wfile.flush()
-        self.wfile.write(b"0\r\n\r\n")
-        self.wfile.flush()
-
-    def upstream(self, token, body):
-        headers = {}
-        for k, v in self.headers.items():
-            kl = k.lower()
-            if kl not in NOT_UPSTREAM and not kl.startswith(("tailscale-", "x-forwarded-")):
-                headers[k] = v
-        betas = [b.strip() for v in self.headers.get_all("anthropic-beta", []) for b in v.split(",")]
-        headers["anthropic-beta"] = ",".join(dict.fromkeys([b for b in betas if b] + [OAUTH_BETA]))
-        headers["authorization"] = f"Bearer {token}"
-        if body is not None:
-            headers["content-length"] = str(len(body))
-        cls = http.client.HTTPSConnection if UPSTREAM.scheme == "https" else http.client.HTTPConnection
-        conn = cls(UPSTREAM.hostname, UPSTREAM.port, timeout=900)
-        conn.request(self.command, self.path, body=body, headers=headers)
-        return conn, conn.getresponse()
-
-    # ---- the proxy
-
-    def proxy(self):
-        started = time.time()
-        try:
-            body = self.read_body()
-        except ValueError as e:
-            self.close_connection = True
-            return self.send_api_error(413, "request_too_large", f"claude-gateway: {e}")
-        dev = self.developer()
-        if dev is None:
-            who = self.headers.get("tailscale-user-login") or self.client_address[0]
-            log(f"refused {self.command} {self.path.split('?', 1)[0]} from {who}: missing or unknown developer key")
-            # 403 rather than 401: Claude Code retries a 401 for minutes before giving up.
-            return self.send_api_error(403, "permission_error",
-                                       "claude-gateway: missing or unknown developer key. "
-                                       "Set ANTHROPIC_AUTH_TOKEN to the key your admin gave you.")
-        accounts = ACCOUNT_FILE.get()
-        labels = list(accounts)
-        if not labels:
-            return self.send_api_error(503, "api_error", "claude-gateway: no accounts configured.")
-        session = self.headers.get("x-claude-code-session-id") or f"dev:{dev}"
-        path = self.path.split("?", 1)[0]
-        tried, last = [], None
-        while True:
-            label = POOL.choose(labels, session, set(tried))
-            if label is None:
-                break
-            tried.append(label)
-            try:
-                conn, resp = self.upstream(accounts[label], body)
-            except (OSError, http.client.HTTPException) as e:
-                log(f"{dev} {self.command} {path} -> {label}: upstream error {e!r}")
-                return self.send_api_error(502, "api_error",
-                                           f"claude-gateway: could not reach the Anthropic API ({type(e).__name__}).")
-            headers = {k.lower(): v for k, v in resp.getheaders()}
-            POOL.observe(label, headers)
+            resp = await CLIENT.request(method, url, headers=headers, data=body or None,
+                                        allow_redirects=False)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log(f"{dev} {method} {path} -> {label}: upstream error {e!r}")
+            return api_error(502, "api_error",
+                             f"claude-gateway: could not reach the Anthropic API ({type(e).__name__}).")
+        async with resp:
+            got = {k.lower(): v for k, v in resp.headers.items()}
+            POOL.observe(label, got)
             if resp.status in (401, 429):
-                data = resp.read()
-                conn.close()
+                await resp.read()  # drain the short error body so the connection can be reused
                 if resp.status == 401:
                     POOL.block(label, time.time() + AUTH_FAIL_COOLDOWN,
                                "token rejected (401); replace it with `claude-gateway account add`")
-                elif headers.get(UNIFIED + "status") == "rejected":
-                    POOL.block(label, reset_time(headers), "usage limit reached")
+                elif got.get(UNIFIED + "status") == "rejected":
+                    POOL.block(label, reset_time(got), "usage limit reached")
                 else:
                     POOL.block(label, time.time() + THROTTLE_COOLDOWN, "throttled (429)")
-                last = (resp.status, resp.getheaders(), data, headers)
+                last = (resp.status, got)
                 continue
-            try:
-                self.relay(resp)
-            finally:
-                conn.close()
-            POOL.served(label, dev)
-            switched = f" (switched from {', '.join(tried[:-1])})" if len(tried) > 1 else ""
-            log(f"{dev} {self.command} {path} -> {label} {resp.status} "
-                f"{time.time() - started:.1f}s{switched}")
-            return
-        self.all_blocked(dev, path, labels, last)
+            out = await relay(request, resp, f"{dev} {method} {path} -> {label}")
+        POOL.served(label, dev)
+        switched = f" (switched from {', '.join(tried[:-1])})" if len(tried) > 1 else ""
+        log(f"{dev} {method} {path} -> {label} {resp.status} {time.time() - started:.1f}s{switched}")
+        return out
+    return all_blocked(dev, method, path, labels, last)
 
-    def all_blocked(self, dev, path, labels, last):
-        if last and last[0] == 401 and all(
-                "401" in (POOL.accounts.get(l, {}).get("blocked_reason") or "") for l in labels):
-            log(f"{dev} {self.command} {path}: every account token was rejected")
-            return self.send_api_error(401, "authentication_error",
-                                       "claude-gateway: every team account token was rejected. Ask your admin to replace them.")
-        reset = POOL.earliest_reset(labels) or time.time() + FALLBACK_BLOCK
-        log(f"{dev} {self.command} {path}: all {len(labels)} accounts limited; first back in {until_text(reset)}")
-        # Shaped like a subscription usage limit so Claude Code shows its normal
-        # "limit reached, resets at ..." message (and can wait for the reset).
-        claim = (last[3].get(UNIFIED + "representative-claim") if last else None) or "five_hour"
-        self.send_api_error(429, "rate_limit_error",
-                            f"claude-gateway: all {len(labels)} team accounts are at their usage limit. "
-                            f"The first one is back in {until_text(reset)}.",
-                            headers=[(UNIFIED + "status", "rejected"),
-                                     (UNIFIED + "reset", str(int(reset))),
-                                     (UNIFIED + "representative-claim", claim),
-                                     ("retry-after", str(max(1, int(reset - time.time()))))])
 
-    # ---- status page
+async def relay(request, resp, what):
+    """Stream the upstream response through as it arrives (SSE-friendly)."""
+    # Per-account usage headers would make Claude Code warn about one account's
+    # limit while the pool still has room, so they are dropped.
+    headers = [(k, v) for k, v in resp.headers.items()
+               if k.lower() not in NOT_DOWNSTREAM and not k.lower().startswith(UNIFIED)]
+    out = web.StreamResponse(status=resp.status, reason=resp.reason, headers=headers)
+    await out.prepare(request)
+    try:
+        async for chunk in resp.content.iter_any():
+            await out.write(chunk)
+        await out.write_eof()
+    except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionResetError) as e:
+        log(f"{what}: stream ended early ({e!r})")  # upstream or developer dropped mid-stream
+    return out
 
-    def gateway_page(self, path):
-        snap = POOL.snapshot(list(ACCOUNT_FILE.get()))
-        if path.endswith("/health"):
-            body = json.dumps({"ok": True, "accounts": len(snap["accounts"]),
-                               "available": snap["available"]}).encode()
-            return self.send_buffered(200, [("content-type", "application/json")], body)
-        if path.endswith("/status"):
-            return self.send_buffered(200, [("content-type", "application/json")],
-                                      json.dumps(snap, indent=2).encode())
-        self.send_buffered(200, [("content-type", "text/html; charset=utf-8"),
-                                 ("cache-control", "no-store")], render_html(snap).encode())
+
+def all_blocked(dev, method, path, labels, last):
+    if last and last[0] == 401 and all(
+            "401" in (POOL.accounts.get(l, {}).get("blocked_reason") or "") for l in labels):
+        log(f"{dev} {method} {path}: every account token was rejected")
+        return api_error(401, "authentication_error",
+                         "claude-gateway: every team account token was rejected. Ask your admin to replace them.")
+    reset = POOL.earliest_reset(labels) or time.time() + FALLBACK_BLOCK
+    log(f"{dev} {method} {path}: all {len(labels)} accounts limited; first back in {until_text(reset)}")
+    # Shaped like a subscription usage limit so Claude Code shows its normal
+    # "limit reached, resets at ..." message (and can wait for the reset).
+    claim = (last[1].get(UNIFIED + "representative-claim") if last else None) or "five_hour"
+    return api_error(429, "rate_limit_error",
+                     f"claude-gateway: all {len(labels)} team accounts are at their usage limit. "
+                     f"The first one is back in {until_text(reset)}.",
+                     headers={UNIFIED + "status": "rejected",
+                              UNIFIED + "reset": str(int(reset)),
+                              UNIFIED + "representative-claim": claim,
+                              "retry-after": str(max(1, int(reset - time.time())))})
+
+
+# --------------------------------------------------------------------------- status page
+
+def gateway_page(path):
+    snap = POOL.snapshot(list(ACCOUNT_FILE.get()))
+    if path.endswith("/health"):
+        return web.json_response({"ok": True, "accounts": len(snap["accounts"]),
+                                  "available": snap["available"]})
+    if path.endswith("/status"):
+        return web.json_response(snap, dumps=lambda d: json.dumps(d, indent=2))
+    return web.Response(text=render_html(snap), content_type="text/html",
+                        headers={"cache-control": "no-store"})
 
 
 def render_html(snap):
@@ -506,6 +420,8 @@ for (const t of document.querySelectorAll('time')) {{
 </script></body></html>"""
 
 
+# --------------------------------------------------------------------------- server
+
 def serve(argv):
     global POOL
     host, port = "127.0.0.1", DEFAULT_PORT
@@ -516,28 +432,37 @@ def serve(argv):
             port = int(value)
     DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
     POOL = Pool()
-    class Server(http.server.ThreadingHTTPServer):
-        daemon_threads = True
-        request_queue_size = 128  # Claude Code sends bursts of parallel requests (subagents)
 
-    server = Server((host, port), Handler)
-
-    def persist_loop():
+    async def persist_loop():
         while True:
-            time.sleep(5)
+            await asyncio.sleep(5)
             try:
                 POOL.persist()
             except OSError as e:
                 log(f"could not save state: {e}")
 
-    threading.Thread(target=persist_loop, daemon=True).start()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: threading.Thread(target=server.shutdown).start())
-    log(f"listening on http://{host}:{port} -> {UPSTREAM.geturl()} "
-        f"({len(ACCOUNT_FILE.get())} accounts, {len(KEY_FILE.get())} developer keys)")
-    server.serve_forever()
-    POOL.persist()
-    log("stopped")
+    async def lifespan(_app):
+        global CLIENT
+        CLIENT = aiohttp.ClientSession(
+            auto_decompress=False,  # pass bytes through untouched
+            skip_auto_headers=("Accept-Encoding", "User-Agent"),
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=900),
+            connector=aiohttp.TCPConnector(limit=0))
+        saver = asyncio.create_task(persist_loop())
+        log(f"listening on http://{host}:{port} -> {UPSTREAM} "
+            f"({len(ACCOUNT_FILE.get())} accounts, {len(KEY_FILE.get())} developer keys)")
+        yield
+        saver.cancel()
+        await CLIENT.close()
+        POOL.persist()
+        log("stopped")
+
+    app = web.Application(client_max_size=MAX_BODY)
+    app.router.add_route("*", "/{tail:.*}", handle)
+    app.cleanup_ctx.append(lifespan)
+    # backlog: Claude Code sends bursts of parallel requests (subagents).
+    web.run_app(app, host=host, port=port, backlog=128, shutdown_timeout=15,
+                access_log=None, print=None)
 
 
 # --------------------------------------------------------------------------- admin CLI
@@ -641,7 +566,3 @@ def main():
         print(__doc__.strip())
         return 0 if argv[:1] in ([], ["-h"], ["--help"]) else 1
     return commands[argv[0]](argv[1:]) or 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

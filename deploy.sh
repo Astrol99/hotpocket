@@ -36,25 +36,29 @@ if ! remote incus info "$NAME" >/dev/null 2>&1; then
     sleep 2
   done
 
-  echo "==> Installing python3 and Tailscale"
+  echo "==> Installing Python and Tailscale"
   in_ct_sh "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq &&
     apt-get install -y -qq python3 curl ca-certificates >/dev/null &&
     curl -fsSL https://tailscale.com/install.sh | sh >/dev/null"
   in_ct useradd --system --home-dir /var/lib/claude-gateway --shell /usr/sbin/nologin claude-gateway
 fi
 
+echo "==> Installing uv"
+in_ct_sh "command -v uv >/dev/null ||
+  curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh >/dev/null"
+
 echo "==> Installing the gateway"
-if [ "$HOST" = local ]; then
-  src="$DIR"
-else
-  src=$(remote mktemp -d)
-  scp -q "$DIR/claude-gateway" "$DIR/claude-gateway.service" "$DIR/hardening.conf" "$HOST:$src/"
-fi
-remote "incus file push -q $src/claude-gateway $NAME/usr/local/bin/claude-gateway --mode 0755 &&
-        incus file push -q $src/claude-gateway.service $NAME/etc/systemd/system/claude-gateway.service --mode 0644 &&
-        incus file push -q -p $src/hardening.conf $NAME/etc/systemd/system/claude-gateway.service.d/zzzz-hardening.conf --mode 0644"
-[ "$HOST" = local ] || remote rm -rf "$src"
-in_ct_sh "systemctl daemon-reload && systemctl enable -q claude-gateway && systemctl restart claude-gateway"
+in_ct_sh "rm -rf /opt/claude-gateway/src && mkdir -p /opt/claude-gateway"
+tar -C "$DIR" --exclude=__pycache__ -cf - pyproject.toml uv.lock src claude-gateway.service hardening.conf |
+  remote incus exec "$NAME" -- tar -C /opt/claude-gateway --no-same-owner -xf -
+# Install the exact locked dependency versions into /opt/claude-gateway/.venv,
+# using the container's system Python (no interpreter download).
+in_ct_sh "cd /opt/claude-gateway &&
+  UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never uv sync -q --frozen --no-dev --no-editable --python /usr/bin/python3 &&
+  ln -sf /opt/claude-gateway/.venv/bin/claude-gateway /usr/local/bin/claude-gateway &&
+  install -m 0644 claude-gateway.service /etc/systemd/system/claude-gateway.service &&
+  install -D -m 0644 hardening.conf /etc/systemd/system/claude-gateway.service.d/zzzz-hardening.conf &&
+  systemctl daemon-reload && systemctl enable -q claude-gateway && systemctl restart claude-gateway"
 
 sleep 2
 if ! in_ct systemctl is-active -q claude-gateway; then

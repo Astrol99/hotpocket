@@ -1,12 +1,12 @@
-"""End-to-end tests for claude-gateway against a fake Anthropic API. Run: python3 gateway/tests/test_gateway.py"""
+"""End-to-end tests for claude-gateway against a fake Anthropic API. Run: uv run tests/test_gateway.py"""
 import http.client, json, os, subprocess, sys, tempfile, time
 from pathlib import Path
 HERE = Path(__file__).resolve().parent
-GW = str(HERE.parent / "claude-gateway")
+GW = [sys.executable, "-m", "claude_gateway"]  # the installed package (uv run installs it)
 G = tempfile.mkdtemp(prefix="gw-test-")
 env = dict(os.environ, CLAUDE_GATEWAY_DATA=f"{G}/data", CLAUDE_GATEWAY_UPSTREAM="http://127.0.0.1:18901", CLAUDE_GATEWAY_PORT="18900")
 def cli(*args, stdin=None):
-    r = subprocess.run([sys.executable, "-I", GW, *args], env=env, input=stdin, capture_output=True, text=True)
+    r = subprocess.run([*GW, *args], env=env, input=stdin, capture_output=True, text=True)
     return r.returncode, (r.stdout + r.stderr).strip()
 def seen():
     try: return [json.loads(l) for l in open(f"{G}/seen.log")]
@@ -23,7 +23,7 @@ rc, key = cli("key", "add", "alice"); key = key.splitlines()[0]
 results.append(ok(key.startswith("cgw-"), "key add"))
 modes = oct(os.stat(f"{G}/data/accounts.json").st_mode & 0o777), oct(os.stat(f"{G}/data/keys.json").st_mode & 0o777)
 results.append(ok(modes == ("0o600", "0o600"), f"secret files are 0600 {modes}"))
-gw = subprocess.Popen([sys.executable, "-I", GW, "serve", "--port", "18900"], env=env, stdout=open(f"{G}/gw.log", "w"), stderr=subprocess.STDOUT)
+gw = subprocess.Popen([*GW, "serve", "--port", "18900"], env=env, stdout=open(f"{G}/gw.log", "w"), stderr=subprocess.STDOUT)
 time.sleep(1)
 
 def call(headers, body=b'{"model":"x"}', conn=None, chunked=False):
@@ -43,6 +43,8 @@ def call(headers, body=b'{"model":"x"}', conn=None, chunked=False):
 H = {"authorization": f"Bearer {key}", "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14",
      "x-claude-code-session-id": "s1", "tailscale-user-login": "alice@example.com", "content-type": "application/json"}
 
+c = http.client.HTTPConnection("127.0.0.1", 18900); c.request("HEAD", "/api/hello"); hr = c.getresponse(); hr.read()
+results.append(ok(hr.status == 200, "keyless HEAD /api/hello connectivity check answered locally"))
 r, body, _, _, _ = call({"content-type": "application/json"})
 results.append(ok(r.status == 403 and b"developer key" in body, "no key -> 403"))
 r, body, _, _, _ = call(dict(H, authorization="Bearer cgw-wrong"))

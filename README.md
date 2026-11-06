@@ -24,8 +24,9 @@ The gateway runs in its own incus container (`claude-gateway`) and is reachable
 only over Tailscale at `https://claude-gateway.<your-tailnet>.ts.net`.
 
 **Requirements:** an incus host, Tailscale, and one long-lived token per account
-from `claude setup-token`. The gateway is a single Python 3.8+ file with no
-dependencies.
+from `claude setup-token`. The gateway is a small Python 3.10+ package built on
+[aiohttp](https://docs.aiohttp.org/), managed with [uv](https://docs.astral.sh/uv/).
+`deploy.sh` installs uv in the container and the exact versions in `uv.lock`.
 
 ## For developers
 
@@ -91,14 +92,16 @@ incus exec claude-gateway -- journalctl -u claude-gateway -f    # request log
 Changes to accounts and keys apply immediately, with no restart. Accounts are
 tried in the order you added them when usage is tied.
 
-## Tests
+## Development
 
 ```sh
-python3 tests/test_gateway.py
+uv run tests/test_gateway.py              # end-to-end tests
+uv run claude-gateway serve --port 8080   # run it locally
 ```
 
 The tests run the gateway against a fake Anthropic API, so they need no real
-tokens.
+tokens. Set `CLAUDE_GATEWAY_DATA` to a scratch folder when running locally;
+it defaults to `/var/lib/claude-gateway`.
 
 ## Notes
 
@@ -107,8 +110,9 @@ tokens.
   it with `account add`.
 - In the Tailscale admin console, turn off key expiry for the `claude-gateway`
   machine so it doesn't drop off the tailnet after 180 days.
-- Files in the container: `/usr/local/bin/claude-gateway` (code) and
-  `/var/lib/claude-gateway/` (`accounts.json`, `keys.json`, `state.json`, all
-  `0600`). The service runs as the unprivileged `claude-gateway` user.
+- Files in the container: `/opt/claude-gateway/` (code and its `.venv`, with
+  `claude-gateway` linked into `/usr/local/bin`) and `/var/lib/claude-gateway/`
+  (`accounts.json`, `keys.json`, `state.json`, all `0600`). The service runs as
+  the unprivileged `claude-gateway` user.
 - `hardening.conf` re-enables `NoNewPrivileges`, which the incus Ubuntu image
   turns off for every service by default.

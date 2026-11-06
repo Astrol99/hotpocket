@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 User=claude-gateway
 Group=claude-gateway
-ExecStart=/usr/bin/python3 -I /usr/local/bin/claude-gateway serve --host 127.0.0.1 --port 8080
+ExecStart=/opt/claude-gateway/.venv/bin/claude-gateway serve --host 127.0.0.1 --port 8080
 Environment=CLAUDE_GATEWAY_DATA=/var/lib/claude-gateway
 StateDirectory=claude-gateway
 StateDirectoryMode=0700
