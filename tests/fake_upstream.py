@@ -16,6 +16,8 @@ class H(http.server.BaseHTTPRequestHandler):
                               b'{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}')
         if tok.endswith("THROTTLE"):
             return self.reply(429, {}, b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}')
+        if tok.endswith("SLOWDOWN"):  # an ordinary 429 that says how long to wait
+            return self.reply(429, {"retry-after": "2"}, b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}')
         if tok.endswith("BAD"):
             return self.reply(401, {}, b'{"type":"error","error":{"type":"authentication_error","message":"invalid"}}')
         self.send_response(200)
@@ -29,6 +31,9 @@ class H(http.server.BaseHTTPRequestHandler):
         for i in range(3):
             c = f"event: delta\ndata: {{\"i\": {i}, \"acct\": \"{tok[-4:]}\"}}\n\n".encode()
             self.wfile.write(b"%x\r\n%s\r\n" % (len(c), c)); self.wfile.flush(); time.sleep(0.4)
+            if tok.endswith("TRUNC"):  # drop the connection mid-stream, without the final chunk
+                self.close_connection = True
+                return
         self.wfile.write(b"0\r\n\r\n")
     def reply(self, code, headers, body):
         self.send_response(code)

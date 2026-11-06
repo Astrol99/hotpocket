@@ -132,6 +132,40 @@ n0 = len(seen())
 r, body, *_ = call(H)
 ok(r.status == 200 and [x["tok"] for x in seen()[n0:]] == ["sk-ant-oat01-FIXED"], "replaced token is used right away")
 
+# upstream drops mid-stream -> the developer sees a broken response, not a short "complete" one
+cli("account", "import", stdin="trunc=sk-ant-oat01-TRUNC\n")
+for label in ("throttle", "bad"):
+    cli("account", "rm", label)
+try:
+    r, body, *_ = call(H)
+    ok(False, f"truncated upstream stream reported as complete ({len(body)} bytes)")
+except http.client.IncompleteRead:
+    ok("stream ended early" in open(f"{G}/gw.log").read(), "truncated upstream stream surfaces as an incomplete read")
+
+# an ordinary 429 with retry-after blocks the account only that long (not the 60 s default)
+cli("account", "import", stdin="slow=sk-ant-oat01-SLOWDOWN\n"); cli("account", "rm", "trunc")
+r, body, *_ = call(H)
+_, acc = status()
+ok(r.status == 429 and int(r.headers["retry-after"]) <= 2 and acc["slow"]["blocked_until"] < time.time() + 3,
+   f"upstream retry-after honored (retry-after {r.headers.get('retry-after')})")
+
+# an absolute-form request target must never be glued onto the upstream host (token leak)
+n0 = len(seen())
+c = http.client.HTTPConnection("127.0.0.1", 18900, timeout=10)
+c.request("POST", "http://evil.example/v1/messages", body=b"{}", headers=H)
+r = c.getresponse(); r.read()
+ok(r.status == 400 and len(seen()) == n0, f"absolute-form request target refused ({r.status}), nothing sent upstream")
+
+# a corrupt accounts file is never overwritten by the CLI, and the server keeps its last good copy
+good_accounts = open(f"{G}/data/accounts.json").read()
+open(f"{G}/data/accounts.json", "w").write(good_accounts.rstrip().rstrip("}") + ",}")  # trailing comma
+rc, out = cli("account", "add", "new", stdin="sk-ant-oat01-NEW\n")
+ok(rc != 0 and "not valid JSON" in out and open(f"{G}/data/accounts.json").read().endswith(",}"),
+   "CLI refuses to overwrite a corrupt accounts file")
+ok(get("/_gateway/health")[0].status == 200 and status()[1].get("slow") is not None,
+   "server keeps the last good accounts while the file is corrupt")
+open(f"{G}/data/accounts.json", "w").write(good_accounts)
+
 gw.terminate(); gw.wait(5)
 st = json.load(open(f"{G}/data/state.json"))
 ok(st["accounts"]["limited"]["blocked_until"] > time.time(), "state persisted on shutdown")

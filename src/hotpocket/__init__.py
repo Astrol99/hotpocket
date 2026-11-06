@@ -31,6 +31,7 @@ import hashlib
 import hmac
 import html
 import json
+import math
 import os
 import re
 import secrets
@@ -56,7 +57,7 @@ OAUTH_BETA = "oauth-2025-04-20"
 UNIFIED = "anthropic-ratelimit-unified-"
 WINDOWS = {"five_hour": "5h", "seven_day": "7d"}  # our field name -> header infix
 STICKY_MAX_UTIL = 0.95      # move a session off its account above this utilization
-THROTTLE_COOLDOWN = 60      # a 429 that isn't a usage-limit rejection
+THROTTLE_COOLDOWN = 60      # an ordinary 429 that gives no retry-after
 AUTH_FAIL_COOLDOWN = 600    # a token the API rejected (401)
 FALLBACK_BLOCK = 3600       # usage-limit rejection without a reset time
 SESSION_TTL = 6 * 3600
@@ -81,6 +82,8 @@ def until_text(ts):
     secs = int(ts - time.time())
     if secs <= 0:
         return "now"
+    if secs < 60:
+        return f"{secs}s"
     h, m = divmod((secs + 59) // 60, 60)
     return f"{h // 24}d{h % 24}h" if h >= 24 else f"{h}h{m:02d}m" if h else f"{m}m"
 
@@ -103,10 +106,13 @@ def fingerprint(token):
 # --------------------------------------------------------------------------- files
 
 def read_json(path, default):
+    """A missing file is `default`; a corrupt one raises ValueError so it is never overwritten."""
     try:
         return json.loads(path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
         return default
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path} is not valid JSON ({e}); fix or remove it") from None
 
 
 def write_json(path, data):
@@ -130,11 +136,16 @@ class Watched:
 
     def get(self):
         try:
-            mtime = self.path.stat().st_mtime_ns
+            st = self.path.stat()
+            mtime = (st.st_mtime_ns, st.st_ino, st.st_size)  # write_json always makes a new inode
         except FileNotFoundError:
             mtime = None
         if mtime != self.mtime:
-            self.data, self.mtime = read_json(self.path, {}), mtime
+            self.mtime = mtime
+            try:
+                self.data = read_json(self.path, {})
+            except ValueError as e:
+                log(f"{e}; still using the last good copy")
         return self.data
 
 
@@ -143,7 +154,11 @@ class Watched:
 
 class Pool:
     def __init__(self):
-        saved = read_json(STATE, {})
+        try:
+            saved = read_json(STATE, {})
+        except ValueError as e:
+            log(f"{e}; starting with empty usage state")
+            saved = {}
         self.accounts = saved.get("accounts", {})  # label -> usage, block and request count
         self.devs = saved.get("devs", {})
         self.sessions = {}                          # session id -> (label, last seen)
@@ -224,8 +239,8 @@ class Pool:
         cutoff = time.time() - SESSION_TTL
         self.sessions = {s: v for s, v in self.sessions.items() if v[1] > cutoff}
         if self.dirty:
-            self.dirty = False
             write_json(STATE, {"accounts": self.accounts, "devs": self.devs})
+            self.dirty = False
 
 
 ACCOUNT_FILE = Watched(ACCOUNTS)
@@ -278,6 +293,9 @@ async def proxy(request):
         # The gateway never sends 401: Claude Code retries a 401 for minutes before giving up.
         return api_error(403, "permission_error", "hotpocket: missing or unknown developer key. "
                          "Set ANTHROPIC_AUTH_TOKEN to the key your admin gave you.")
+    if not request.raw_path.startswith("/"):
+        # An absolute-form target ("http://host/...") would be glued onto UPSTREAM's host.
+        return api_error(400, "invalid_request_error", "hotpocket: request target must be a path.")
     tag = f"{dev} {request.method} {request.path}"
     accounts = ACCOUNT_FILE.get()
     if not accounts:
@@ -301,14 +319,19 @@ async def proxy(request):
         async with resp:
             POOL.observe(label, resp.headers)
             if resp.status in (401, 429):
-                await resp.read()  # drain the short error body so the connection can be reused
+                try:
+                    await resp.read()  # drain the short error body so the connection can be reused
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    pass  # the status alone decides what happens next
                 if resp.status == 401:
                     POOL.block(label, token, "auth", time.time() + AUTH_FAIL_COOLDOWN)
                 elif resp.headers.get(UNIFIED + "status") == "rejected":
                     POOL.block(label, token, "limit", reset_time(resp.headers),
                                resp.headers.get(UNIFIED + "representative-claim"))
-                else:
-                    POOL.block(label, token, "throttle", time.time() + THROTTLE_COOLDOWN)
+                else:  # an ordinary rate limit: wait as long as the API asks
+                    retry = num(resp.headers, "retry-after")
+                    POOL.block(label, token, "throttle",
+                               time.time() + (max(retry, 1) if retry is not None else THROTTLE_COOLDOWN))
                 continue
             out = await relay(request, resp, f"{tag} -> {label}")
         POOL.served(label, dev)
@@ -332,6 +355,10 @@ async def relay(request, resp, what):
         await out.write_eof()
     except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionResetError) as e:
         log(f"{what}: stream ended early ({e!r})")  # upstream or developer dropped mid-stream
+        # Drop the developer's connection without the final chunk, so a truncated
+        # body is seen as a failure instead of a complete response.
+        if request.transport is not None:
+            request.transport.close()
     return out
 
 
@@ -339,8 +366,11 @@ def all_blocked(tag, accounts):
     """Every account is blocked: answer according to why."""
     blocks = [POOL.accounts.get(label, {}) for label in accounts]
     kinds = {b.get("blocked_kind") for b in blocks}
-    reset = max(min(b.get("blocked_until", 0) for b in blocks), time.time() + 1)
-    retry = {"retry-after": str(int(reset - time.time()))}
+    # A rejected token stays rejected when its block lapses, so it only sets the
+    # reset time when every account is in that state.
+    timed = [b for b in blocks if b.get("blocked_kind") != "auth"] or blocks
+    reset = max(min(b.get("blocked_until", 0) for b in timed), time.time() + 1)
+    retry = {"retry-after": str(math.ceil(reset - time.time()))}
     log(f"{tag}: all {len(blocks)} accounts blocked ({', '.join(sorted(map(str, kinds)))}); "
         f"first back in {until_text(reset)}")
     if kinds == {"auth"}:
@@ -349,11 +379,11 @@ def all_blocked(tag, accounts):
     if "limit" in kinds:
         # Shaped like a subscription usage limit so Claude Code shows its normal
         # "limit reached, resets at ..." message (and can wait for the reset).
-        claim = next((b["blocked_claim"] for b in blocks if b.get("blocked_claim")), "five_hour")
+        claim = next((b["blocked_claim"] for b in timed if b.get("blocked_claim")), "five_hour")
         return api_error(429, "rate_limit_error",
                          f"hotpocket: all {len(blocks)} team accounts are at their usage limit "
                          f"or unavailable. The first one is back in {until_text(reset)}.",
-                         headers={UNIFIED + "status": "rejected", UNIFIED + "reset": str(int(reset)),
+                         headers={UNIFIED + "status": "rejected", UNIFIED + "reset": str(math.ceil(reset)),
                                   UNIFIED + "representative-claim": claim, **retry})
     return api_error(429, "rate_limit_error",
                      f"hotpocket: all team accounts are briefly throttled. Retry in {until_text(reset)}.",
@@ -479,8 +509,16 @@ def read_token():
     return sys.stdin.read()
 
 
+def read_admin_json(path):
+    """For CLI edits: refuse to touch a corrupt file instead of replacing its contents."""
+    try:
+        return read_json(path, {})
+    except ValueError as e:
+        die(str(e))
+
+
 def remove(path, name, what):
-    entries = read_json(path, {})
+    entries = read_admin_json(path)
     if entries.pop(name, None) is None:
         die(f"No {what} named '{name}'.")
     write_json(path, entries)
@@ -488,7 +526,7 @@ def remove(path, name, what):
 
 def cmd_account(argv):
     sub, args = (argv[0], argv[1:]) if argv else ("list", [])
-    accounts = read_json(ACCOUNTS, {})
+    accounts = read_admin_json(ACCOUNTS)
     if sub == "add" and len(args) == 1 and LABEL_RE.fullmatch(args[0]):
         token = clean_token(read_token())
         if not token:
@@ -526,7 +564,7 @@ def cmd_account(argv):
 
 def cmd_key(argv):
     sub, args = (argv[0], argv[1:]) if argv else ("list", [])
-    keys = read_json(KEYS, {})
+    keys = read_admin_json(KEYS)
     if sub == "add" and len(args) == 1 and LABEL_RE.fullmatch(args[0]):
         keys[args[0]] = "hp-" + secrets.token_urlsafe(24)
         write_json(KEYS, keys)
@@ -542,10 +580,12 @@ def cmd_key(argv):
 
 
 def cmd_status(_argv):
+    host = "127.0.0.1" if HOST in ("", "0.0.0.0", "::") else HOST
+    host = f"[{host}]" if ":" in host else host
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/_gateway/status", timeout=5) as r:
+        with urllib.request.urlopen(f"http://{host}:{PORT}/_gateway/status", timeout=5) as r:
             snap = json.load(r)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         die(f"Gateway isn't answering on port {PORT} ({e}). Check: systemctl status hotpocket")
     rows = [("ACCOUNT", "STATE", "5H", "5H RESET", "7D", "7D RESET", "SESSIONS", "REQUESTS")]
     for a in snap["accounts"]:
