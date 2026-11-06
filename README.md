@@ -95,24 +95,29 @@ tried in the order you added them when usage is tied.
 ## Development
 
 ```sh
-uv run tests/test_gateway.py              # end-to-end tests
-uv run claude-gateway serve --port 8080   # run it locally
+uv run tests/test_gateway.py                    # end-to-end tests
+CLAUDE_GATEWAY_DATA=./data uv run claude-gateway serve   # run it locally
 ```
 
 The tests run the gateway against a fake Anthropic API, so they need no real
-tokens. Set `CLAUDE_GATEWAY_DATA` to a scratch folder when running locally;
-it defaults to `/var/lib/claude-gateway`.
+tokens. Settings are environment variables: `CLAUDE_GATEWAY_DATA` (default
+`/var/lib/claude-gateway`), `CLAUDE_GATEWAY_HOST` (default `127.0.0.1`) and
+`CLAUDE_GATEWAY_PORT` (default `8080`).
 
 ## Notes
 
 - Tokens from `claude setup-token` last a year. If one is revoked, the gateway
   skips it, logs `token rejected (401)`, and the status page shows it. Replace
-  it with `account add`.
+  it with `account add`; the new token is used right away.
 - In the Tailscale admin console, turn off key expiry for the `claude-gateway`
   machine so it doesn't drop off the tailnet after 180 days.
 - Files in the container: `/opt/claude-gateway/` (code and its `.venv`, with
   `claude-gateway` linked into `/usr/local/bin`) and `/var/lib/claude-gateway/`
   (`accounts.json`, `keys.json`, `state.json`, all `0600`). The service runs as
   the unprivileged `claude-gateway` user.
-- `hardening.conf` re-enables `NoNewPrivileges`, which the incus Ubuntu image
-  turns off for every service by default.
+- `deploy.sh` creates the container if needed, copies the code in, and runs
+  `setup.sh` inside it. Every step skips work that is already done, so a failed
+  run can just be run again.
+- `hardening.conf` re-enables `NoNewPrivileges`, `ProtectKernelTunables` and
+  `ProtectControlGroups`, which the incus Ubuntu image turns off for every
+  service by default.

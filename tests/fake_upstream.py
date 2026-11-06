@@ -6,7 +6,7 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("content-length") or 0); body = self.rfile.read(n)
         tok = self.headers.get("authorization", "").removeprefix("Bearer ")
-        SEEN.write(json.dumps({"tok": tok, "path": self.path, "beta": self.headers.get("anthropic-beta"),
+        SEEN.write(json.dumps({"tok": tok, "beta": self.headers.get("anthropic-beta"),
             "leaked": [k for k in self.headers if k.lower() in ("x-api-key", "tailscale-user-login", "x-forwarded-for")],
             "body_len": len(body)}) + "\n"); SEEN.flush()
         now = time.time()

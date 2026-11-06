@@ -7,7 +7,8 @@ request is retried on the next account before the developer sees anything.
 Account tokens never leave the gateway; developers get their own keys.
 
 Server
-  claude-gateway serve [--host 127.0.0.1] [--port 8080]
+  claude-gateway serve                 listens on CLAUDE_GATEWAY_HOST:CLAUDE_GATEWAY_PORT
+                                       (default 127.0.0.1:8080)
 
 Admin (run on the gateway host)
   claude-gateway account add LABEL     token on stdin (from `claude setup-token`)
@@ -26,6 +27,7 @@ Developers point Claude Code at it (e.g. in ~/.claude/settings.json "env"):
 
 import asyncio
 import getpass
+import hashlib
 import hmac
 import html
 import json
@@ -35,6 +37,7 @@ import secrets
 import sys
 import time
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 import aiohttp
@@ -46,16 +49,19 @@ ACCOUNTS = DATA / "accounts.json"   # {label: token}, in priority order
 KEYS = DATA / "keys.json"           # {developer name: key}
 STATE = DATA / "state.json"         # usage and blocks, survives restarts
 UPSTREAM = os.environ.get("CLAUDE_GATEWAY_UPSTREAM", "https://api.anthropic.com").rstrip("/")
-DEFAULT_PORT = int(os.environ.get("CLAUDE_GATEWAY_PORT", "8080"))
+HOST = os.environ.get("CLAUDE_GATEWAY_HOST", "127.0.0.1")
+PORT = int(os.environ.get("CLAUDE_GATEWAY_PORT", "8080"))
 
 OAUTH_BETA = "oauth-2025-04-20"
 UNIFIED = "anthropic-ratelimit-unified-"
+WINDOWS = {"five_hour": "5h", "seven_day": "7d"}  # our field name -> header infix
 STICKY_MAX_UTIL = 0.95      # move a session off its account above this utilization
 THROTTLE_COOLDOWN = 60      # a 429 that isn't a usage-limit rejection
 AUTH_FAIL_COOLDOWN = 600    # a token the API rejected (401)
 FALLBACK_BLOCK = 3600       # usage-limit rejection without a reset time
 SESSION_TTL = 6 * 3600
-MAX_BODY = 100 * 1024 * 1024
+MAX_BODY = 32 * 1024 * 1024  # the Messages API's own request size limit
+REASONS = {"auth": "token rejected (401)", "limit": "usage limit reached", "throttle": "throttled (429)"}
 
 LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 TOKEN_RE = re.compile(r"sk-ant-oat[0-9]*-[A-Za-z0-9_-]+")
@@ -70,11 +76,28 @@ def log(msg):
 
 
 def until_text(ts):
+    if not ts:
+        return "-"
     secs = int(ts - time.time())
     if secs <= 0:
         return "now"
     h, m = divmod((secs + 59) // 60, 60)
     return f"{h // 24}d{h % 24}h" if h >= 24 else f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def pct(v):
+    return "-" if v is None else f"{v * 100:.0f}%"
+
+
+def num(headers, name):
+    try:
+        return float(headers[name])
+    except (KeyError, ValueError):
+        return None
+
+
+def fingerprint(token):
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
 # --------------------------------------------------------------------------- files
@@ -116,102 +139,90 @@ class Watched:
 
 
 # --------------------------------------------------------------------------- pool
-# Everything below runs on the event loop's single thread, so no locks are needed.
+# Everything here runs on the event loop's single thread, so no locks are needed.
 
 class Pool:
     def __init__(self):
         saved = read_json(STATE, {})
-        self.accounts = saved.get("accounts", {})
+        self.accounts = saved.get("accounts", {})  # label -> usage, block and request count
         self.devs = saved.get("devs", {})
-        self.sessions = {}
+        self.sessions = {}                          # session id -> (label, last seen)
         self.dirty = False
 
     def _acct(self, label):
         return self.accounts.setdefault(label, {"requests": 0})
 
+    def blocked(self, label, token, now):
+        # A block belongs to the token that earned it, so replacing a token clears it.
+        a = self.accounts.get(label, {})
+        return a.get("blocked_until", 0) > now and a.get("blocked_token") == fingerprint(token)
+
     def _util(self, label):
         a, now = self.accounts.get(label, {}), time.time()
-        fresh = lambda reset: reset is not None and reset <= now  # window has reset since
-        u5 = 0 if fresh(a.get("r5")) else a.get("u5", 0)
-        u7 = 0 if fresh(a.get("r7")) else a.get("u7", 0)
-        return max(u5, u7)
 
-    def choose(self, labels, session, exclude):
+        def used(window):  # a window whose reset time has passed is back to 0%
+            reset = a.get(window + "_reset")
+            return 0 if reset is not None and reset <= now else a.get(window) or 0
+
+        return max(used(w) for w in WINDOWS)
+
+    def choose(self, accounts, session, exclude):
         now = time.time()
-        ready = [l for l in labels
-                 if l not in exclude and self._acct(l).get("blocked_until", 0) <= now]
+        ready = [l for l, token in accounts.items()
+                 if l not in exclude and not self.blocked(l, token, now)]
         if not ready:
             return None
-        sticky = self.sessions.get(session, (None, 0))[0]
-        if sticky in ready and self._util(sticky) < STICKY_MAX_UTIL:
-            choice = sticky
-        else:
-            choice = min(ready, key=lambda l: (self._util(l), labels.index(l)))
+        sticky = self.sessions.get(session, (None,))[0]
+        choice = (sticky if sticky in ready and self._util(sticky) < STICKY_MAX_UTIL
+                  else min(ready, key=self._util))  # ties go to the earlier-added account
         self.sessions[session] = (choice, now)
-        if len(self.sessions) > 5000:
-            self.sessions = {s: v for s, v in self.sessions.items() if v[1] > now - SESSION_TTL}
         return choice
 
     def observe(self, label, headers):
         """Record the account's live usage from the API's response headers."""
-        if not any(k.startswith(UNIFIED) for k in headers):
-            return
         a = self._acct(label)
-        for key, name in (("u5", "5h-utilization"), ("u7", "7d-utilization"),
-                          ("r5", "5h-reset"), ("r7", "7d-reset")):
-            try:
-                a[key] = float(headers[UNIFIED + name])
-            except (KeyError, ValueError):
-                pass
-        a["status"] = headers.get(UNIFIED + "status", a.get("status"))
-        a["seen"] = time.time()
-        self.dirty = True
+        for window, infix in WINDOWS.items():
+            for key, value in ((window, num(headers, f"{UNIFIED}{infix}-utilization")),
+                               (window + "_reset", num(headers, f"{UNIFIED}{infix}-reset"))):
+                if value is not None:
+                    a[key], self.dirty = value, True
 
-    def block(self, label, until, reason):
-        a = self._acct(label)
-        a["blocked_until"], a["blocked_reason"] = until, reason
+    def block(self, label, token, kind, until, claim=None):
+        self._acct(label).update(blocked_kind=kind, blocked_until=until, blocked_claim=claim,
+                                 blocked_token=fingerprint(token))
         self.dirty = True
-        log(f"account {label}: {reason}; back in {until_text(until)}")
+        hint = "; replace it with `claude-gateway account add`" if kind == "auth" else ""
+        log(f"account {label}: {REASONS[kind]}{hint}; back in {until_text(until)}")
 
     def served(self, label, dev):
-        now = time.time()
-        a = self._acct(label)
-        a["requests"] = a.get("requests", 0) + 1
-        a["last_used"] = now
+        self._acct(label)["requests"] += 1
         d = self.devs.setdefault(dev, {"requests": 0})
         d["requests"] += 1
-        d["last_seen"], d["last_account"] = now, label
+        d["last_seen"], d["last_account"] = time.time(), label
         self.dirty = True
 
-    def earliest_reset(self, labels):
-        times = [self.accounts.get(l, {}).get("blocked_until", 0) for l in labels]
-        times = [t for t in times if t > time.time()]
-        return min(times) if times else None
-
-    def snapshot(self, labels):
+    def snapshot(self, accounts):
         now = time.time()
-        active = {}
-        for label, seen in self.sessions.values():
-            if seen > now - 3600:
-                active[label] = active.get(label, 0) + 1
-        accounts = []
-        for l in labels:
-            a = self.accounts.get(l, {})
-            blocked = a.get("blocked_until", 0) > now
-            accounts.append({
-                "label": l, "available": not blocked,
-                "blocked_until": a.get("blocked_until") if blocked else None,
-                "blocked_reason": a.get("blocked_reason") if blocked else None,
-                "five_hour": a.get("u5"), "five_hour_reset": a.get("r5"),
-                "seven_day": a.get("u7"), "seven_day_reset": a.get("r7"),
-                "requests": a.get("requests", 0), "last_used": a.get("last_used"),
-                "active_sessions": active.get(l, 0),
+        active = Counter(l for l, seen in self.sessions.values() if seen > now - 3600)
+        rows = []
+        for label, token in accounts.items():
+            a = self.accounts.get(label, {})
+            blocked = self.blocked(label, token, now)
+            rows.append({
+                "label": label, "available": not blocked,
+                "blocked_kind": a["blocked_kind"] if blocked else None,
+                "blocked_reason": REASONS.get(a["blocked_kind"]) if blocked else None,
+                "blocked_until": a["blocked_until"] if blocked else None,
+                **{k: a.get(k) for w in WINDOWS for k in (w, w + "_reset")},
+                "requests": a.get("requests", 0), "active_sessions": active[label],
             })
-        devs = [{"name": n, **d} for n, d in sorted(self.devs.items())]
-        return {"now": now, "accounts": accounts, "developers": devs,
-                "available": sum(a["available"] for a in accounts)}
+        return {"accounts": rows, "available": sum(r["available"] for r in rows),
+                "developers": [{"name": n, **d} for n, d in sorted(self.devs.items())]}
 
-    def persist(self):
+    def tick(self):
+        """Every few seconds: forget idle sessions and save state if it changed."""
+        cutoff = time.time() - SESSION_TTL
+        self.sessions = {s: v for s, v in self.sessions.items() if v[1] > cutoff}
         if self.dirty:
             self.dirty = False
             write_json(STATE, {"accounts": self.accounts, "devs": self.devs})
@@ -225,23 +236,11 @@ CLIENT: aiohttp.ClientSession = None
 
 def reset_time(headers):
     """When a usage-limit rejection lifts, from the response headers."""
-    try:
-        return float(headers[UNIFIED + "reset"])
-    except (KeyError, ValueError):
-        pass
-    resets = []
-    for window in ("5h", "7d"):
-        if headers.get(f"{UNIFIED}{window}-status") == "rejected":
-            try:
-                resets.append(float(headers[f"{UNIFIED}{window}-reset"]))
-            except (KeyError, ValueError):
-                pass
-    if resets:
-        return max(resets)
-    try:
-        return time.time() + float(headers["retry-after"])
-    except (KeyError, ValueError):
-        return time.time() + FALLBACK_BLOCK
+    rejected = [num(headers, f"{UNIFIED}{infix}-reset") for infix in WINDOWS.values()
+                if headers.get(f"{UNIFIED}{infix}-status") == "rejected"]
+    retry = num(headers, "retry-after")
+    return (num(headers, UNIFIED + "reset") or max(filter(None, rejected), default=None)
+            or time.time() + (retry if retry is not None else FALLBACK_BLOCK))
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -253,11 +252,11 @@ def api_error(status, etype, message, headers=None):
 
 def developer(headers):
     auth = headers.get("authorization", "")
-    presented = auth[7:].strip() if auth.lower().startswith("bearer ") \
-        else headers.get("x-api-key", "").strip()
+    presented = (auth[7:] if auth.lower().startswith("bearer ") else headers.get("x-api-key", "")).strip()
     if presented:
+        presented = presented.encode()
         for name, key in KEY_FILE.get().items():
-            if hmac.compare_digest(presented.encode(), str(key).encode()):
+            if hmac.compare_digest(presented, str(key).encode()):
                 return name
     return None
 
@@ -270,63 +269,53 @@ def upstream_headers(headers):
     return out
 
 
-async def handle(request):
-    path = request.path.rstrip("/")
-    if path in ("/_gateway", "/_gateway/status", "/_gateway/health"):
-        return gateway_page(path)
-    if path == "/api/hello":  # Claude Code's keyless connectivity check; answer like the API does
-        return web.json_response({"message": "hello"})
-    return await proxy(request)
-
-
 async def proxy(request):
-    started, method, path = time.time(), request.method, request.path
+    started = time.time()
     dev = developer(request.headers)
     if dev is None:
         who = request.headers.get("tailscale-user-login") or request.remote
-        log(f"refused {method} {path} from {who}: missing or unknown developer key")
-        # 403 rather than 401: Claude Code retries a 401 for minutes before giving up.
+        log(f"refused {request.method} {request.path} from {who}: missing or unknown developer key")
+        # The gateway never sends 401: Claude Code retries a 401 for minutes before giving up.
         return api_error(403, "permission_error", "claude-gateway: missing or unknown developer key. "
                          "Set ANTHROPIC_AUTH_TOKEN to the key your admin gave you.")
+    tag = f"{dev} {request.method} {request.path}"
     accounts = ACCOUNT_FILE.get()
-    labels = list(accounts)
-    if not labels:
+    if not accounts:
         return api_error(503, "api_error", "claude-gateway: no accounts configured.")
     body = await request.read()  # buffered so the request can be resent on another account
     session = request.headers.get("x-claude-code-session-id") or f"dev:{dev}"
     headers = upstream_headers(request.headers)
     url = URL(UPSTREAM + request.raw_path, encoded=True)
-    tried, last = [], None
-    while (label := POOL.choose(labels, session, tried)) is not None:
+    tried = []
+    while (label := POOL.choose(accounts, session, tried)) is not None:
         tried.append(label)
-        headers["authorization"] = f"Bearer {accounts[label]}"
+        token = accounts[label]
+        headers["authorization"] = f"Bearer {token}"
         try:
-            resp = await CLIENT.request(method, url, headers=headers, data=body or None,
+            resp = await CLIENT.request(request.method, url, headers=headers, data=body or None,
                                         allow_redirects=False)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            log(f"{dev} {method} {path} -> {label}: upstream error {e!r}")
+            log(f"{tag} -> {label}: upstream error {e!r}")
             return api_error(502, "api_error",
                              f"claude-gateway: could not reach the Anthropic API ({type(e).__name__}).")
         async with resp:
-            got = {k.lower(): v for k, v in resp.headers.items()}
-            POOL.observe(label, got)
+            POOL.observe(label, resp.headers)
             if resp.status in (401, 429):
                 await resp.read()  # drain the short error body so the connection can be reused
                 if resp.status == 401:
-                    POOL.block(label, time.time() + AUTH_FAIL_COOLDOWN,
-                               "token rejected (401); replace it with `claude-gateway account add`")
-                elif got.get(UNIFIED + "status") == "rejected":
-                    POOL.block(label, reset_time(got), "usage limit reached")
+                    POOL.block(label, token, "auth", time.time() + AUTH_FAIL_COOLDOWN)
+                elif resp.headers.get(UNIFIED + "status") == "rejected":
+                    POOL.block(label, token, "limit", reset_time(resp.headers),
+                               resp.headers.get(UNIFIED + "representative-claim"))
                 else:
-                    POOL.block(label, time.time() + THROTTLE_COOLDOWN, "throttled (429)")
-                last = (resp.status, got)
+                    POOL.block(label, token, "throttle", time.time() + THROTTLE_COOLDOWN)
                 continue
-            out = await relay(request, resp, f"{dev} {method} {path} -> {label}")
+            out = await relay(request, resp, f"{tag} -> {label}")
         POOL.served(label, dev)
         switched = f" (switched from {', '.join(tried[:-1])})" if len(tried) > 1 else ""
-        log(f"{dev} {method} {path} -> {label} {resp.status} {time.time() - started:.1f}s{switched}")
+        log(f"{tag} -> {label} {resp.status} {time.time() - started:.1f}s{switched}")
         return out
-    return all_blocked(dev, method, path, labels, last)
+    return all_blocked(tag, accounts)
 
 
 async def relay(request, resp, what):
@@ -346,45 +335,55 @@ async def relay(request, resp, what):
     return out
 
 
-def all_blocked(dev, method, path, labels, last):
-    if last and last[0] == 401 and all(
-            "401" in (POOL.accounts.get(l, {}).get("blocked_reason") or "") for l in labels):
-        log(f"{dev} {method} {path}: every account token was rejected")
-        return api_error(401, "authentication_error",
-                         "claude-gateway: every team account token was rejected. Ask your admin to replace them.")
-    reset = POOL.earliest_reset(labels) or time.time() + FALLBACK_BLOCK
-    log(f"{dev} {method} {path}: all {len(labels)} accounts limited; first back in {until_text(reset)}")
-    # Shaped like a subscription usage limit so Claude Code shows its normal
-    # "limit reached, resets at ..." message (and can wait for the reset).
-    claim = (last[1].get(UNIFIED + "representative-claim") if last else None) or "five_hour"
+def all_blocked(tag, accounts):
+    """Every account is blocked: answer according to why."""
+    blocks = [POOL.accounts.get(label, {}) for label in accounts]
+    kinds = {b.get("blocked_kind") for b in blocks}
+    reset = max(min(b.get("blocked_until", 0) for b in blocks), time.time() + 1)
+    retry = {"retry-after": str(int(reset - time.time()))}
+    log(f"{tag}: all {len(blocks)} accounts blocked ({', '.join(sorted(map(str, kinds)))}); "
+        f"first back in {until_text(reset)}")
+    if kinds == {"auth"}:
+        return api_error(403, "permission_error", "claude-gateway: every team account token was "
+                         "rejected. Ask your admin to replace them.")
+    if "limit" in kinds:
+        # Shaped like a subscription usage limit so Claude Code shows its normal
+        # "limit reached, resets at ..." message (and can wait for the reset).
+        claim = next((b["blocked_claim"] for b in blocks if b.get("blocked_claim")), "five_hour")
+        return api_error(429, "rate_limit_error",
+                         f"claude-gateway: all {len(blocks)} team accounts are at their usage limit "
+                         f"or unavailable. The first one is back in {until_text(reset)}.",
+                         headers={UNIFIED + "status": "rejected", UNIFIED + "reset": str(int(reset)),
+                                  UNIFIED + "representative-claim": claim, **retry})
     return api_error(429, "rate_limit_error",
-                     f"claude-gateway: all {len(labels)} team accounts are at their usage limit. "
-                     f"The first one is back in {until_text(reset)}.",
-                     headers={UNIFIED + "status": "rejected",
-                              UNIFIED + "reset": str(int(reset)),
-                              UNIFIED + "representative-claim": claim,
-                              "retry-after": str(max(1, int(reset - time.time())))})
+                     f"claude-gateway: all team accounts are briefly throttled. Retry in {until_text(reset)}.",
+                     headers=retry)
 
 
 # --------------------------------------------------------------------------- status page
 
-def gateway_page(path):
-    snap = POOL.snapshot(list(ACCOUNT_FILE.get()))
-    if path.endswith("/health"):
-        return web.json_response({"ok": True, "accounts": len(snap["accounts"]),
-                                  "available": snap["available"]})
-    if path.endswith("/status"):
-        return web.json_response(snap, dumps=lambda d: json.dumps(d, indent=2))
-    return web.Response(text=render_html(snap), content_type="text/html",
+async def health(_request):
+    snap = POOL.snapshot(ACCOUNT_FILE.get())
+    return web.json_response({"ok": True, "accounts": len(snap["accounts"]), "available": snap["available"]})
+
+
+async def status_json(_request):
+    return web.json_response(POOL.snapshot(ACCOUNT_FILE.get()), dumps=lambda d: json.dumps(d, indent=2))
+
+
+async def status_page(_request):
+    return web.Response(text=render_html(POOL.snapshot(ACCOUNT_FILE.get())), content_type="text/html",
                         headers={"cache-control": "no-store"})
 
 
-def render_html(snap):
-    def pct(v):
-        return "–" if v is None else f"{v * 100:.0f}%"
+async def hello(_request):
+    # Claude Code's keyless connectivity check; answer it the way the API does.
+    return web.json_response({"message": "hello"})
 
+
+def render_html(snap):
     def when(ts):
-        return f'<time data-ts="{int(ts)}"></time>' if ts else "–"
+        return f'<time data-ts="{int(ts)}"></time>' if ts else "-"
 
     rows = []
     for a in snap["accounts"]:
@@ -394,8 +393,8 @@ def render_html(snap):
                     f"<td>{pct(a['five_hour'])}</td><td>{when(a['five_hour_reset'])}</td>"
                     f"<td>{pct(a['seven_day'])}</td><td>{when(a['seven_day_reset'])}</td>"
                     f"<td>{a['active_sessions']}</td><td>{a['requests']}</td></tr>")
-    devs = "".join(f"<tr><td>{html.escape(d['name'])}</td><td>{d.get('requests', 0)}</td>"
-                   f"<td>{when(d.get('last_seen'))}</td><td>{html.escape(d.get('last_account') or '–')}</td></tr>"
+    devs = "".join(f"<tr><td>{html.escape(d['name'])}</td><td>{d['requests']}</td>"
+                   f"<td>{when(d.get('last_seen'))}</td><td>{html.escape(d.get('last_account') or '-')}</td></tr>"
                    for d in snap["developers"]) or '<tr><td colspan="4">No requests yet</td></tr>'
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="30">
@@ -424,20 +423,15 @@ for (const t of document.querySelectorAll('time')) {{
 
 def serve(argv):
     global POOL
-    host, port = "127.0.0.1", DEFAULT_PORT
-    for flag, value in zip(argv[::2], argv[1::2]):
-        if flag == "--host":
-            host = value
-        elif flag == "--port":
-            port = int(value)
-    DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if argv:
+        die("`serve` takes no arguments; set CLAUDE_GATEWAY_HOST and CLAUDE_GATEWAY_PORT instead.")
     POOL = Pool()
 
-    async def persist_loop():
+    async def ticker():
         while True:
             await asyncio.sleep(5)
             try:
-                POOL.persist()
+                POOL.tick()
             except OSError as e:
                 log(f"could not save state: {e}")
 
@@ -448,21 +442,23 @@ def serve(argv):
             skip_auto_headers=("Accept-Encoding", "User-Agent"),
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=900),
             connector=aiohttp.TCPConnector(limit=0))
-        saver = asyncio.create_task(persist_loop())
-        log(f"listening on http://{host}:{port} -> {UPSTREAM} "
+        task = asyncio.create_task(ticker())
+        log(f"listening on http://{HOST}:{PORT} -> {UPSTREAM} "
             f"({len(ACCOUNT_FILE.get())} accounts, {len(KEY_FILE.get())} developer keys)")
         yield
-        saver.cancel()
+        task.cancel()
         await CLIENT.close()
-        POOL.persist()
+        POOL.tick()
         log("stopped")
 
     app = web.Application(client_max_size=MAX_BODY)
-    app.router.add_route("*", "/{tail:.*}", handle)
+    app.router.add_get("/_gateway", status_page)
+    app.router.add_get("/_gateway/status", status_json)
+    app.router.add_get("/_gateway/health", health)
+    app.router.add_get("/api/hello", hello)
+    app.router.add_route("*", "/{tail:.*}", proxy)  # everything else goes to the API
     app.cleanup_ctx.append(lifespan)
-    # backlog: Claude Code sends bursts of parallel requests (subagents).
-    web.run_app(app, host=host, port=port, backlog=128, shutdown_timeout=15,
-                access_log=None, print=None)
+    web.run_app(app, host=HOST, port=PORT, shutdown_timeout=15, access_log=None, print=None)
 
 
 # --------------------------------------------------------------------------- admin CLI
@@ -472,18 +468,30 @@ def die(msg):
     sys.exit(1)
 
 
+def clean_token(raw):
+    token = "".join(raw.split())
+    return token if TOKEN_RE.fullmatch(token) else None
+
+
 def read_token():
     if sys.stdin.isatty():
         return getpass.getpass("Paste the token from `claude setup-token` (hidden): ")
     return sys.stdin.read()
 
 
+def remove(path, name, what):
+    entries = read_json(path, {})
+    if entries.pop(name, None) is None:
+        die(f"No {what} named '{name}'.")
+    write_json(path, entries)
+
+
 def cmd_account(argv):
     sub, args = (argv[0], argv[1:]) if argv else ("list", [])
     accounts = read_json(ACCOUNTS, {})
     if sub == "add" and len(args) == 1 and LABEL_RE.fullmatch(args[0]):
-        token = re.sub(r"\s+", "", read_token())
-        if not TOKEN_RE.fullmatch(token):
+        token = clean_token(read_token())
+        if not token:
             die("That doesn't look like a Claude Code token (expected sk-ant-oat...).")
         accounts[args[0]] = token
         write_json(ACCOUNTS, accounts)
@@ -495,8 +503,8 @@ def cmd_account(argv):
             if not line or line.startswith("#"):
                 continue
             label, sep, token = line.partition("=")
-            label, token = label.strip(), re.sub(r"\s+", "", token)
-            if not sep or not LABEL_RE.fullmatch(label) or not TOKEN_RE.fullmatch(token):
+            label, token = label.strip(), clean_token(token)
+            if not sep or not LABEL_RE.fullmatch(label) or not token:
                 die(f"Line {n} isn't `label=sk-ant-oat...` (nothing was imported).")
             entries.append((label, token))
         if not entries:
@@ -505,9 +513,7 @@ def cmd_account(argv):
         write_json(ACCOUNTS, accounts)
         print(f"Imported {', '.join(l for l, _ in entries)} ({len(accounts)} total).")
     elif sub == "rm" and len(args) == 1:
-        if accounts.pop(args[0], None) is None:
-            die(f"No account named '{args[0]}'.")
-        write_json(ACCOUNTS, accounts)
+        remove(ACCOUNTS, args[0], "account")
         print(f"Removed account '{args[0]}'.")
     elif sub == "list":
         for label, token in accounts.items():
@@ -527,9 +533,7 @@ def cmd_key(argv):
         print(keys[args[0]])
         print(f"Key for '{args[0]}' (shown once; `key add` again to replace it).", file=sys.stderr)
     elif sub == "rm" and len(args) == 1:
-        if keys.pop(args[0], None) is None:
-            die(f"No key for '{args[0]}'.")
-        write_json(KEYS, keys)
+        remove(KEYS, args[0], "developer key")
         print(f"Removed key for '{args[0]}'. Their requests are refused from now on.")
     elif sub == "list":
         print("\n".join(keys) or "No developer keys. Create one with: claude-gateway key add NAME")
@@ -539,18 +543,15 @@ def cmd_key(argv):
 
 def cmd_status(_argv):
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{DEFAULT_PORT}/_gateway/status", timeout=5) as r:
+        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/_gateway/status", timeout=5) as r:
             snap = json.load(r)
     except OSError as e:
-        die(f"Gateway isn't answering on port {DEFAULT_PORT} ({e}). Check: systemctl status claude-gateway")
-    pct = lambda v: "-" if v is None else f"{v * 100:.0f}%"
+        die(f"Gateway isn't answering on port {PORT} ({e}). Check: systemctl status claude-gateway")
     rows = [("ACCOUNT", "STATE", "5H", "5H RESET", "7D", "7D RESET", "SESSIONS", "REQUESTS")]
     for a in snap["accounts"]:
         state = "ready" if a["available"] else f"{a['blocked_reason']} ({until_text(a['blocked_until'])})"
-        rows.append((a["label"], state, pct(a["five_hour"]),
-                     until_text(a["five_hour_reset"]) if a["five_hour_reset"] else "-",
-                     pct(a["seven_day"]),
-                     until_text(a["seven_day_reset"]) if a["seven_day_reset"] else "-",
+        rows.append((a["label"], state, pct(a["five_hour"]), until_text(a["five_hour_reset"]),
+                     pct(a["seven_day"]), until_text(a["seven_day_reset"]),
                      str(a["active_sessions"]), str(a["requests"])))
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     for r in rows:

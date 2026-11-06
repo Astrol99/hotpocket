@@ -1,13 +1,9 @@
 [Unit]
 Description=Claude Code team gateway
-After=network-online.target
-Wants=network-online.target
 
 [Service]
 User=claude-gateway
-Group=claude-gateway
-ExecStart=/opt/claude-gateway/.venv/bin/claude-gateway serve --host 127.0.0.1 --port 8080
-Environment=CLAUDE_GATEWAY_DATA=/var/lib/claude-gateway
+ExecStart=/opt/claude-gateway/.venv/bin/claude-gateway serve
 StateDirectory=claude-gateway
 StateDirectoryMode=0700
 Restart=always
