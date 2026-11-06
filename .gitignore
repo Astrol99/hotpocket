@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Never commit credentials
+tokens.txt
+*.tokens
+accounts.json
+keys.json
+state.json

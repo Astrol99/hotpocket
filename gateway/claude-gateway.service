@@ -1,0 +1,29 @@
+[Unit]
+Description=Claude Code team gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=claude-gateway
+Group=claude-gateway
+ExecStart=/usr/bin/python3 -I /usr/local/bin/claude-gateway serve --host 127.0.0.1 --port 8080
+Environment=CLAUDE_GATEWAY_DATA=/var/lib/claude-gateway
+StateDirectory=claude-gateway
+StateDirectoryMode=0700
+Restart=always
+RestartSec=2
+
+# Hardening: the service only needs to read/write its own state directory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
