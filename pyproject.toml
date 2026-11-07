@@ -8,7 +8,7 @@ license-files = ["LICENSE"]
 dependencies = ["aiohttp>=3.9", "genai-prices>=0.2.1"]
 
 [project.scripts]
-hotpocket = "hotpocket:main"
+hotpocket = "hotpocket.server:main"
 
 [build-system]
 requires = ["uv_build>=0.11.3,<0.12"]

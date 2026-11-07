@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hotpocket</title>
+<link rel="stylesheet" href="/_gateway/page.css">
+</head>
+<body>
+<!-- Icons: Lucide v1.70.0 (lucide.dev, ISC license), copied unchanged from lucide-static. -->
+<svg hidden><symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol><symbol id="i-key-round" viewBox="0 0 24 24"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/></symbol><symbol id="i-trash-2" viewBox="0 0 24 24"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol><symbol id="i-ellipsis" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol></svg>
+<header><h1>hotpocket</h1><span id="who"></span></header>
+<p id="offline" class="note bad" hidden>Can't reach the gateway. Retrying…</p>
+<p id="access" class="note" hidden>Read-only: Tailscale didn't say who you are (a tagged device?). Open this page on your own device to get your key.</p>
+<div id="tiles" class="tiles"></div>
+
+<section>
+  <div class="head"><h2>Pool</h2><button class="admin-only" data-opens="account-form"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>Add account</button></div>
+  <div class="wrap"><table id="accounts"></table></div>
+  <form id="account-form" class="panel admin-only" autocomplete="off" hidden>
+    <h3>Add an account, or replace its token</h3>
+    <p class="sub">Run <code>claude setup-token</code>, open the link it prints in a private browser window
+      signed in as that account, and paste the token it gives you. Saving under an existing label replaces
+      that account's token. Saved tokens can't be viewed again.</p>
+    <div class="row">
+      <label>Label<input name="label" required maxlength="254" placeholder="dev" spellcheck="false"></label>
+      <label class="grow">Token<input name="token" type="password" required placeholder="sk-ant-oat01-…" spellcheck="false"></label>
+      <button class="primary">Save</button>
+    </div>
+  </form>
+</section>
+
+<section>
+  <div class="head"><h2>Developers</h2><span><button id="mine-button" class="primary" hidden>Get my key</button><button
+    class="admin-only" data-opens="key-form"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>Add developer</button></span></div>
+  <div id="dev-tiles" class="tiles"></div>
+  <div class="wrap"><table id="developers"></table></div>
+  <div id="reveal" class="panel" hidden>
+    <h3 id="reveal-title"></h3>
+    <p class="sub">Copy it now: it won't be shown again. Paste this into Claude Code and it sets itself up,
+      keeping your claude.ai login for Artifacts and connectors (the prompt includes the key):</p>
+    <pre id="reveal-prompt"></pre>
+    <button class="primary" data-copy="reveal-prompt">Copy</button>
+    <p class="sub">On a machine where Claude Code isn't logged in to a Claude account, add this to
+      <code>~/.claude/settings.json</code> instead (into its <code>env</code> section if it has one), then restart
+      <code>claude</code>:</p>
+    <pre id="reveal-snippet"></pre>
+    <button data-copy="reveal-snippet">Copy</button>
+    <button id="reveal-done">Done</button>
+  </div>
+  <form id="key-form" class="panel admin-only" autocomplete="off" hidden>
+    <h3>Give a developer a key</h3>
+    <div class="row">
+      <label>Name<input name="dev" required maxlength="254" placeholder="alice@example.com" spellcheck="false"></label>
+      <button class="primary">Create key</button>
+    </div>
+  </form>
+</section>
+
+<div id="toast" class="toast" role="status" hidden></div>
+
+<script src="/_gateway/page.js"></script>
+</body>
+</html>

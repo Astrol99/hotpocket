@@ -1,136 +1,3 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>hotpocket</title>
-<style>
-:root{color-scheme:light;--bg:#fff;--fg:#1d1d1f;--mute:#6e6e73;--line:#e5e5ea;--panel:#f5f5f7;--track:#e3e3e8;--fill:#3a63d8;--ok:#1a7f37;--bad:#b42318;--btn:#1d1d1f;--btn-fg:#fff;
-  --s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#008300;--s7:#6250d6;--s8:#e34948}
-@media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#111113;--fg:#f2f2f2;--mute:#a1a1a6;--line:#2c2c2e;--panel:#1c1c1f;--track:#2e2e33;--fill:#7c9dff;--ok:#4ac26b;--bad:#ff6b5e;--btn:#f2f2f2;--btn-fg:#111;
-  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767}}
-*{box-sizing:border-box}
-[hidden]{display:none!important}
-body{background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;margin:0 auto;padding:24px 16px 72px;max-width:1160px}
-header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 16px}
-h1{font-size:22px;margin:0;letter-spacing:-.01em}
-h2{font-size:16px;margin:0}
-.head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:36px 0 6px}
-.head button+button{margin-left:6px}
-h3{font-size:14px;margin:0 0 2px}
-#who,.sub,.label{color:var(--mute);font-size:13px;font-weight:400}
-.note{background:var(--panel);border-radius:10px;padding:10px 14px;margin:16px 0 0}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:20px}
-.tile,.panel{background:var(--panel);border-radius:12px;padding:14px 16px}
-.panel{margin-top:14px}
-#dev-tiles{margin:12px 0 8px}
-.value{font-size:28px;font-weight:600;line-height:1.25;font-variant-numeric:tabular-nums}
-.wrap{overflow-x:auto}
-table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
-th,td{text-align:left;padding:10px;border-bottom:1px solid var(--line);vertical-align:top;white-space:nowrap}
-thead th{color:var(--mute);font-weight:500;font-size:13px}
-tbody th{font-weight:600}
-.num{text-align:right}
-.meter{display:flex;align-items:center;gap:8px;min-width:150px}
-.track{display:flex;flex:1;height:6px;border-radius:3px;background:var(--track);overflow:hidden}
-.track span{flex-shrink:0}
-.track span:last-child{border-radius:0 3px 3px 0}
-.track span+span{border-left:2px solid var(--panel)}  /* a gap between parts */
-.tile .track{height:8px;border-radius:4px;margin:8px 0 6px}
-.legend{display:flex;flex-wrap:wrap;gap:2px 14px;margin-top:10px;color:var(--mute);font-size:13px}
-.legend i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
-.pct{min-width:3em;text-align:right}
-.ok{color:var(--ok)}.bad{color:var(--bad)}
-.actions{text-align:right}
-.more{padding:5px 8px;border-color:transparent}
-.more .icon{margin:0;vertical-align:middle}
-.icon{width:15px;height:15px;margin-right:6px;vertical-align:-3px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.menu{padding:4px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);box-shadow:0 8px 24px rgb(0 0 0/.18);text-align:left}
-.menu button{display:block;width:100%;text-align:left;border:0;background:none;padding:7px 12px}
-.more:hover,.menu button:hover{background:var(--panel)}
-@supports (position-area:bottom){.menu{inset:auto;margin:4px 0;position-area:bottom span-left;position-try-fallbacks:flip-block}}
-button{font:inherit;font-size:13px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);padding:5px 11px;cursor:pointer}
-button.primary{background:var(--btn);border-color:var(--btn);color:var(--btn-fg);font-size:14px;padding:7px 14px}
-button:disabled{opacity:.5;cursor:default}
-.row{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-top:10px}
-label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mute)}
-label.grow{flex:1;min-width:220px}
-input{font:inherit;font-size:14px;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
-code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
-pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;overflow-x:auto;margin:10px 0}
-#reveal-prompt{white-space:pre-wrap}
-.toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--btn);color:var(--btn-fg);padding:8px 14px;border-radius:10px;font-size:14px;max-width:calc(100% - 32px)}
-body:not(.is-admin) .admin-only{display:none!important}
-/* Phones: each row becomes a card with labelled fields. */
-@media (max-width:640px){
-  .wrap{overflow:visible}
-  table,tbody,tr,th,td{display:block}
-  thead{display:none}
-  tbody tr{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;padding:14px 0;border-bottom:1px solid var(--line);position:relative}
-  tbody th,tbody td{border:0;padding:0;white-space:normal}
-  tbody th{padding-right:44px;overflow-wrap:anywhere}
-  tbody th,td[data-label=State],td[colspan]{grid-column:1/-1}
-  .actions{position:absolute;top:12px;right:0}
-  td[data-label]::before{content:attr(data-label);display:block;color:var(--mute);font-size:12px;margin-bottom:2px}
-  .num{text-align:left}
-  .meter{min-width:0}
-}
-</style>
-</head>
-<body>
-<!-- Icons: Lucide v1.70.0 (lucide.dev, ISC license), copied unchanged from lucide-static. -->
-<svg hidden><symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol><symbol id="i-key-round" viewBox="0 0 24 24"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/></symbol><symbol id="i-trash-2" viewBox="0 0 24 24"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol><symbol id="i-ellipsis" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol></svg>
-<header><h1>hotpocket</h1><span id="who"></span></header>
-<p id="offline" class="note bad" hidden>Can't reach the gateway. Retrying…</p>
-<p id="access" class="note" hidden>Read-only: Tailscale didn't say who you are (a tagged device?). Open this page on your own device to get your key.</p>
-<div id="tiles" class="tiles"></div>
-
-<section>
-  <div class="head"><h2>Pool</h2><button class="admin-only" data-opens="account-form"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>Add account</button></div>
-  <div class="wrap"><table id="accounts"></table></div>
-  <form id="account-form" class="panel admin-only" autocomplete="off" hidden>
-    <h3>Add an account, or replace its token</h3>
-    <p class="sub">Run <code>claude setup-token</code>, open the link it prints in a private browser window
-      signed in as that account, and paste the token it gives you. Saving under an existing label replaces
-      that account's token. Saved tokens can't be viewed again.</p>
-    <div class="row">
-      <label>Label<input name="label" required maxlength="254" placeholder="dev" spellcheck="false"></label>
-      <label class="grow">Token<input name="token" type="password" required placeholder="sk-ant-oat01-…" spellcheck="false"></label>
-      <button class="primary">Save</button>
-    </div>
-  </form>
-</section>
-
-<section>
-  <div class="head"><h2>Developers</h2><span><button id="mine-button" class="primary" hidden>Get my key</button><button
-    class="admin-only" data-opens="key-form"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>Add developer</button></span></div>
-  <div id="dev-tiles" class="tiles"></div>
-  <div class="wrap"><table id="developers"></table></div>
-  <div id="reveal" class="panel" hidden>
-    <h3 id="reveal-title"></h3>
-    <p class="sub">Copy it now: it won't be shown again. Paste this into Claude Code and it sets itself up,
-      keeping your claude.ai login for Artifacts and connectors (the prompt includes the key):</p>
-    <pre id="reveal-prompt"></pre>
-    <button class="primary" data-copy="reveal-prompt">Copy</button>
-    <p class="sub">On a machine where Claude Code isn't logged in to a Claude account, add this to
-      <code>~/.claude/settings.json</code> instead (into its <code>env</code> section if it has one), then restart
-      <code>claude</code>:</p>
-    <pre id="reveal-snippet"></pre>
-    <button data-copy="reveal-snippet">Copy</button>
-    <button id="reveal-done">Done</button>
-  </div>
-  <form id="key-form" class="panel admin-only" autocomplete="off" hidden>
-    <h3>Give a developer a key</h3>
-    <div class="row">
-      <label>Name<input name="dev" required maxlength="254" placeholder="alice@example.com" spellcheck="false"></label>
-      <button class="primary">Create key</button>
-    </div>
-  </form>
-</section>
-
-<div id="toast" class="toast" role="status" hidden></div>
-
-<script>
 'use strict';
 const $ = s => document.querySelector(s);
 const now = () => Date.now() / 1000;
@@ -141,7 +8,9 @@ function h(tag, attrs = {}, ...kids) {
   const e = ['svg', 'use'].includes(tag) ? document.createElementNS('http://www.w3.org/2000/svg', tag)
                                           : document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
-    if (k.startsWith('on')) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v);
+    if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (k === 'style') e.style.cssText = v;  // not as an attribute, which the page's CSP refuses
+    else e.setAttribute(k, v);
   }
   e.append(...kids.flat().filter(k => k != null));
   return e;
@@ -273,7 +142,7 @@ function usageAge(a) {
   return h('div', {class: 'sub', title: clock(a.usage_at)}, 'usage as of ' + ago(a.usage_at));
 }
 
-// A Lucide icon from the set at the top of the page, in the text's color.
+// A Lucide icon from the set in page.html, in the text's color.
 const icon = name => h('svg', {class: 'icon', 'aria-hidden': 'true'}, h('use', {href: '#i-' + name}));
 
 // A row's actions sit behind a "⋯" button, in a native popover: it closes on Esc or a click elsewhere.
@@ -440,6 +309,3 @@ $('#key-form').addEventListener('submit', async e => {
 })();
 // Data that came while a menu was open shows once it closes (toggle doesn't bubble, hence the capture).
 document.addEventListener('toggle', e => { if (e.newState === 'closed' && snap && !$(':popover-open')) render(); }, true);
-</script>
-</body>
-</html>
