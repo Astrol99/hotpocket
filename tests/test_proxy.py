@@ -185,14 +185,14 @@ async def test_rejected_token_is_403_and_its_replacement_used_at_once(gw):
 # --------------------------------------------------------------------------- an API key's credits
 
 async def test_an_api_key_is_used_only_when_every_seat_is_out(gw):
-    store.save_account("credits", "sk-ant-api03-CREDITS")
+    store.save_account("credits", "sk-ant-usr01-CREDITS")  # a personal key (others are sk-ant-api...)
     await call(gw)
     assert toks(gw) == ["LIMITED", "GOOD"]  # seats first
     block(gw, "GOOD", "limit", time.time() + 60)
     oauth = {**dev(store.new_key("bob")), "anthropic-beta": "claude-code-20250219,oauth-2025-04-20"}  # on claude.ai
     assert (await call(gw, oauth))[0].status == 200 and toks(gw)[-1] == "CREDITS"
     sent = gw.seen[-1]["headers"]
-    assert sent["x-api-key"] == "sk-ant-api03-CREDITS" and "authorization" not in sent
+    assert sent["authorization"] == "Bearer sk-ant-usr01-CREDITS"
     assert sent["anthropic-beta"] == "claude-code-20250219"  # an API key needs no OAuth beta
     assert (await status(gw))["accounts"]["credits"]["month_cost"] > 0
     gw.pool.accounts["good"]["blocked_until"] = 0  # the seat is back

@@ -111,17 +111,15 @@ def developer(headers):
 
 
 def upstream_headers(headers, token):
-    """The developer's headers, less their key, Tailscale's and the hop-by-hop ones, with the account's token:
-    an API key as x-api-key, a seat's token as the bearer, with the beta that lets it call the API."""
+    """The developer's headers, less their key, Tailscale's and the hop-by-hop ones, with the account's token
+    as the bearer: an API key as is, a seat's token with the beta that lets it call the API."""
     out = {k: v for k, v in headers.items()
            if k.lower() not in NOT_UPSTREAM and not k.lower().startswith(("tailscale-", "x-forwarded-"))}
     # A developer logged in to claude.ai sends the OAuth beta too; it goes up only with a seat's token.
     betas = [b for v in headers.getall("anthropic-beta", []) for b in map(str.strip, v.split(","))
              if b and b != OAUTH_BETA]
-    if is_api_key(token):
-        out["x-api-key"] = token
-    else:
-        out["authorization"] = f"Bearer {token}"
+    out["authorization"] = f"Bearer {token}"
+    if not is_api_key(token):
         betas.append(OAUTH_BETA)
     if betas:
         out["anthropic-beta"] = ",".join(dict.fromkeys(betas))

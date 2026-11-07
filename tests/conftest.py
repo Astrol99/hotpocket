@@ -24,7 +24,7 @@ async def fake_api(request):
     TRUNC (drops mid-stream), SLOW, PLAIN (a reply that isn't streamed); for API keys, SPENT (the monthly spend
     cap's 429), BROKE (a 402), LOWBAL and CAPPED (out of credits, or at a set spend limit: 400s) and INVALID
     (a 400 about the request). Others stream a reply with token usage."""
-    tok = (request.headers.get("x-api-key") or request.headers.get("authorization", "")).rsplit("-", 1)[-1]
+    tok = request.headers.get("authorization", "").rsplit("-", 1)[-1]
     request.app[SEEN].append({"tok": tok, "path": request.path_qs, "headers": request.headers,
                               "body": await request.read()})
     now = time.time()
