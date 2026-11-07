@@ -251,7 +251,7 @@ function meterCell(a, w, label) {
   if (v == null) return h('td', {class: 'sub', 'data-label': label}, 'no data yet');
   return h('td', {'data-label': label},
     h('div', {class: 'meter'}, bar([{v}], `${a.label} ${label} use`), h('span', {class: 'pct'}, pct(v))),
-    h('div', {class: 'sub', title: reset > now() ? clock(reset) : ''}, left(v) + (reset > now() ? ' · resets ' + until(reset) : '')));
+    reset > now() ? h('div', {class: 'sub', title: clock(reset)}, 'resets ' + until(reset)) : null);
 }
 
 function stateCell(a) {
