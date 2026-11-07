@@ -39,7 +39,7 @@ FALLBACK_BLOCK = 3600       # usage-limit rejection without a reset time
 SESSION_TTL = 6 * 3600
 MAX_BODY = 32 * 1024 * 1024  # the Messages API's own request size limit
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
-REASONS = {"auth": "token rejected (401)", "limit": "usage limit reached"}
+REASONS = {"auth": "token rejected", "limit": "usage limit reached"}
 
 # Account labels, developer names and admin logins. Developer names are often Tailscale logins
 # (you@example.com, you@github); all-dot names are refused because "." and ".." break URLs.
@@ -84,7 +84,9 @@ def usage_of(reply):
             try:
                 event = json.loads(line.removeprefix(b"data:"))
                 message = event.get("message", event)
-                model, usage = message.get("model", model), {**usage, **message["usage"]}
+                # A later event's null or 0 doesn't erase a count already heard (Claude Code merges them so too).
+                fresh = {k: v for k, v in message["usage"].items() if v or k not in usage}
+                model, usage = message.get("model", model), {**usage, **fresh}
             except (ValueError, AttributeError, KeyError, TypeError):
                 pass
     return model, usage
@@ -184,10 +186,8 @@ class Pool:
         if not ready:
             return None
         sticky = self.sessions.get(session, (None,))[0]
-        choice = (sticky if sticky in ready and self._util(sticky) < STICKY_MAX_UTIL
-                  else min(ready, key=self._util))  # ties go to the earlier-added account
-        self.sessions[session] = (choice, now)
-        return choice
+        return (sticky if sticky in ready and self._util(sticky) < STICKY_MAX_UTIL
+                else min(ready, key=self._util))  # ties go to the earlier-added account
 
     def observe(self, label, headers):
         """Record the account's live usage from the API's response headers."""
@@ -209,6 +209,8 @@ class Pool:
 
     def served(self, label, dev, model, usage):
         d, a, cost, now = self.devs.setdefault(dev, {"requests": 0}), self._acct(label), api_cost(model, usage), time.time()
+        if a.get("blocked_until", 0) <= now:
+            a.pop("blocked_kind", None)  # it works again; a block still running (another request's, meanwhile) stays
         windows = a.setdefault("spent", {})
         for w in WINDOWS:  # what each developer spent in the account's current windows, to split its use by
             spent = windows.get(w)
@@ -227,7 +229,9 @@ class Pool:
         now, rows, shares = time.time(), [], {w: Counter() for w in WINDOWS}
         for label, token in accounts.items():
             a = self.accounts.get(label, {})
-            blocked = self.blocked(label, token, now)
+            # Shown as rejected until replaced or working again, though its block lapses so it's retried.
+            rejected = a.get("blocked_kind") == "auth" and a.get("blocked_token") == key_hash(token)[:16]
+            blocked = rejected or self.blocked(label, token, now)
             rows.append({
                 "label": label, "available": not blocked,
                 "blocked_kind": a["blocked_kind"] if blocked else None,
@@ -312,7 +316,7 @@ async def proxy(request):
             log(f"refused {request.method} {request.rel_url.raw_path} from {who}: missing or unknown developer key")
         # The gateway never sends 401: Claude Code retries a 401 for minutes before giving up.
         return api_error(403, "permission_error", "hotpocket: missing or unknown developer key. "
-                         "Set ANTHROPIC_AUTH_TOKEN to the key your admin gave you.")
+                         "Get a new one on the hotpocket status page and paste its setup prompt into Claude Code.")
     if not request.raw_path.startswith("/"):
         # An absolute-form target ("http://host/...") would be glued onto UPSTREAM's host.
         return api_error(400, "invalid_request_error", "hotpocket: request target must be a path.")
@@ -324,7 +328,7 @@ async def proxy(request):
     session = request.headers.get("x-claude-code-session-id") or f"dev:{dev}"
     headers = upstream_headers(request.headers)
     url = URL(UPSTREAM + request.raw_path, encoded=True)
-    tried, plain_429 = [], None
+    tried, refused = [], None
     while (label := POOL.choose(accounts, session, tried)) is not None:
         tried.append(label)
         token = accounts[label]
@@ -338,42 +342,43 @@ async def proxy(request):
                              f"hotpocket: could not reach the Anthropic API ({type(e).__name__}).")
         async with resp:
             POOL.observe(label, resp.headers)
-            if resp.status in (401, 429):
+            if resp.status in (401, 403, 429):
                 try:
                     error = await resp.read()  # also lets the connection be reused
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     error = b""
-                if resp.status == 401:
+                if resp.status == 401 or b"OAuth token has been revoked" in error:  # a revoked token gets a 403
                     POOL.block(label, token, "auth", time.time() + AUTH_FAIL_COOLDOWN)
                 elif resp.headers.get(UNIFIED + "status") == "rejected":
                     POOL.block(label, token, "limit", reset_time(resp.headers),
                                resp.headers.get(UNIFIED + "representative-claim"))
                 else:
-                    # Any other 429 can be about this request (say, a long context the plan doesn't
-                    # cover) rather than the account, so the account isn't blocked for everyone;
-                    # the request just tries the next one, and gets this answer if none takes it.
-                    plain_429 = (downstream_headers(resp.headers), error)
+                    # Any other 403 or 429 can be about this request (say, a model or a long context the
+                    # plan doesn't cover) or this account (its organization), so the account isn't blocked
+                    # for everyone; the request just tries the next one, and gets this answer if none takes it.
+                    refused = (resp.status, downstream_headers(resp.headers), error)
                 continue
             out, reply = await relay(request, resp, f"{tag} -> {label}")
+        POOL.sessions[session] = (label, time.time())  # the session stays where it was served
         POOL.served(label, dev, *usage_of(reply))
         switched = f" (switched from {', '.join(tried[:-1])})" if len(tried) > 1 else ""
         log(f"{tag} -> {label} {resp.status} {time.time() - started:.1f}s{switched}")
         return out
-    if plain_429:
-        headers, error = plain_429
+    if refused:
+        status, headers, error = refused
         try:
             message = str(json.loads(error)["error"]["message"])
         except (ValueError, KeyError, TypeError):
             message = None
         log(f"{tag}: refused by {', '.join(tried)} "
-            f"(429: {(message or error.decode(errors='replace'))[:200]})")
+            f"({status}: {(message or error.decode(errors='replace'))[:200]})")
         if message is not None:  # Anthropic's own answer, with its retry-after and x-should-retry
             headers.setdefault("content-type", "application/json")
-            return web.Response(status=429, body=error, headers=headers)
+            return web.Response(status=status, body=error, headers=headers)
         # Not Anthropic's JSON error (empty, or a proxy's HTML page): Claude Code gets one it can read.
         headers.popall("content-type", None)
-        return api_error(429, "rate_limit_error", "hotpocket: every team account refused this request "
-                         "(429). Try again shortly.", headers=headers)
+        return api_error(status, "rate_limit_error" if status == 429 else "permission_error",
+                         f"hotpocket: every team account refused this request ({status}).", headers=headers)
     return all_blocked(tag, accounts)
 
 
@@ -396,7 +401,7 @@ async def relay(request, resp, what):
                 reply += chunk
             await out.write(chunk)
         await out.write_eof()
-    except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionResetError) as e:
+    except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
         log(f"{what}: stream ended early ({e!r})")  # upstream or developer dropped mid-stream
         # Drop the developer's connection without the final chunk, so a truncated
         # body is seen as a failure instead of a complete response.
@@ -412,7 +417,8 @@ def all_blocked(tag, accounts):
     # A rejected token stays rejected when its block lapses, so it only sets the
     # reset time when every account is in that state.
     timed = [b for b in blocks if b.get("blocked_kind") != "auth"] or blocks
-    reset = max(min(b.get("blocked_until", 0) for b in timed), time.time() + 1)
+    first = min(timed, key=lambda b: b.get("blocked_until", 0))  # the first back, whose limit is the one named
+    reset = max(first.get("blocked_until", 0), time.time() + 1)
     retry = {"retry-after": str(math.ceil(reset - time.time()))}
     log(f"{tag}: all {len(blocks)} accounts blocked ({', '.join(sorted(map(str, kinds)))}); "
         f"first back in {until_text(reset)}")
@@ -421,7 +427,7 @@ def all_blocked(tag, accounts):
                          "rejected. Ask your admin to replace them.")
     # Shaped like a subscription usage limit so Claude Code shows its normal
     # "limit reached, resets at ..." message (and can wait for the reset).
-    claim = next((b["blocked_claim"] for b in timed if b.get("blocked_claim")), "five_hour")
+    claim = first.get("blocked_claim") or "five_hour"
     return api_error(429, "rate_limit_error",
                      f"hotpocket: all {len(blocks)} team accounts are at their usage limit "
                      f"or unavailable. The first one is back in {until_text(reset)}.",
@@ -441,19 +447,17 @@ PAGE_HEADERS = {
 
 
 def viewer(remote, headers):
-    """Who is asking and what they may do: a "member" (signed in to Tailscale, over HTTPS) may
-    get their own key; an "admin" may manage the gateway. Tailscale serve sets these headers
-    on every request it forwards, and runs on this host, so they're only believed from here."""
+    """Who is asking and what they may do: a "member" (signed in to Tailscale) may get their own key;
+    an "admin" may manage the gateway. Tailscale serve sets the login on every request it forwards
+    (none for tagged devices), and runs on this host, so it's only believed from here."""
     if remote not in ("127.0.0.1", "::1"):
-        return {"login": None, "https": False, "member": False, "admin": False}
+        return {"login": None, "member": False, "admin": False}
     login = (headers.get("tailscale-user-login") or "").lower() or None
-    https = headers.get("x-forwarded-proto") == "https"
-    member = bool(login and https)
-    admin = member and db().execute("SELECT 1 FROM admins WHERE login = ?", (login,)).fetchone() is not None
-    return {"login": login, "https": https, "member": member, "admin": admin}
+    admin = bool(login) and db().execute("SELECT 1 FROM admins WHERE login = ?", (login,)).fetchone() is not None
+    return {"login": login, "member": bool(login), "admin": admin}
 
 
-@routes.get("/_gateway/events")
+@routes.get("/_gateway/events", allow_head=False)  # a HEAD reply ends at the headers, while this would write on
 async def events(request):
     """Server-sent events: tells an open status page when usage changes, so it refreshes right away."""
     resp = web.StreamResponse(headers={"content-type": "text/event-stream", "cache-control": "no-store"})
@@ -469,7 +473,7 @@ async def events(request):
             wake = POOL.wake  # the next change to wait for (taken before writing, so none is missed); None at shutdown
             if wake:
                 await resp.write(b"data: changed\n\n")
-    except ConnectionResetError:  # the page closed
+    except ConnectionError:  # the page closed
         pass
     return resp
 
@@ -499,8 +503,8 @@ async def hello(_request):
     return web.json_response({"message": "hello"})
 
 
-ROLES = {"admin": "Only hotpocket admins can do this, over HTTPS.",  # why a viewer without the role is refused
-         "member": "Open this page at its https://….ts.net address on Tailscale."}
+ROLES = {"admin": "Only hotpocket admins can do this.",  # why a viewer without the role is refused
+         "member": "Tailscale didn't say who you are (a tagged device?), so open this page on your own device."}
 
 
 def page_api(role):
@@ -593,7 +597,8 @@ def make_app():
             auto_decompress=False,  # pass bytes through untouched
             skip_auto_headers=("Accept-Encoding", "User-Agent"),
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=900),
-            connector=aiohttp.TCPConnector(limit=0))
+            connector=aiohttp.TCPConnector(limit=0),
+            cookie_jar=aiohttp.DummyCookieJar())  # one account's or developer's cookies never ride along on another's
         task = asyncio.create_task(ticker())
         log(f"listening on http://{HOST}:{PORT} -> {UPSTREAM} "
             f"({len(load_accounts())} accounts, {len(key_names())} developer keys)")
@@ -678,7 +683,9 @@ def main():
     commands = parser.add_subparsers(required=True, metavar="COMMAND")
     commands.add_parser("serve", help="run the gateway on HOTPOCKET_HOST:HOTPOCKET_PORT "
                         "(default 127.0.0.1:8080)").set_defaults(run=lambda _: web.run_app(
-        make_app(), host=HOST, port=PORT, shutdown_timeout=15, access_log=None, print=None))
+        # aiohttp waits shutdown_timeout twice for a request still running, which must fit in Docker's 10 s
+        # stop grace for the final save to run.
+        make_app(), host=HOST, port=PORT, shutdown_timeout=4, access_log=None, print=None))
     admins = commands.add_parser("admin", help="Tailscale logins that may manage accounts and keys "
                                  "on the status page").add_subparsers(required=True, metavar="ACTION")
     for name, run, help in (("add", admin_add, "make a Tailscale login an admin"),

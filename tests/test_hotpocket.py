@@ -19,20 +19,20 @@ TOKEN = "sk-ant-oat01-NEW"
 
 async def fake_api(request):
     """Answers by the token's suffix: LIMITED (usage limit), THROTTLE and SLOWDOWN (plain 429s, the
-    second with retry-after), GARBLED (a 429 that isn't JSON), BAD (401), TRUNC (drops mid-stream),
-    SLOW, PLAIN (a reply that isn't streamed). Others stream a reply with token usage."""
+    second with retry-after), GARBLED (a 429 that isn't JSON), BAD (401), REVOKED and NOMODEL (403s),
+    TRUNC (drops mid-stream), SLOW, PLAIN (a reply that isn't streamed). Others stream a reply with token usage."""
     tok = request.headers.get("authorization", "").rsplit("-", 1)[-1]
     request.app[SEEN].append({"tok": tok, "path": request.path_qs, "headers": request.headers,
                               "body": await request.read()})
     now = time.time()
     status, headers = {"LIMITED": (429, {U + "status": "rejected", U + "reset": str(int(now + 7200))}),
                        "THROTTLE": (429, {}), "SLOWDOWN": (429, {"retry-after": "2", "x-should-retry": "false"}),
-                       "BAD": (401, {})}.get(tok, (200, {}))
+                       "BAD": (401, {}), "REVOKED": (403, {}), "NOMODEL": (403, {})}.get(tok, (200, {}))
     if tok == "GARBLED":
         return web.Response(status=429, text="<html>slow down</html>", content_type="text/html")
     if status != 200:
-        return web.json_response({"type": "error", "error": {"message": f"{tok} says no"}}, status=status,
-                                 headers=headers)
+        message = "OAuth token has been revoked." if tok == "REVOKED" else f"{tok} says no"  # the API's words
+        return web.json_response({"type": "error", "error": {"message": message}}, status=status, headers=headers)
     if tok == "PLAIN":
         return web.json_response({"model": "claude-sonnet-5-5", "usage": {"input_tokens": 1000, "output_tokens": 100}})
     resp = web.StreamResponse(headers={
@@ -101,10 +101,9 @@ async def status(gw, headers=None):
     return {**snap, "accounts": {a["label"]: a for a in snap["accounts"]}}
 
 
-def as_user(gw, login="admin@example.com", https=True, origin="page"):
+def as_user(gw, login="admin@example.com", origin="page"):
     """What Tailscale serve and the browser add when someone uses the status page."""
-    headers = {"x-forwarded-proto": https and "https", "tailscale-user-login": login,
-               "origin": f"https://{gw.host}:{gw.port}" if origin == "page" else origin}
+    headers = {"tailscale-user-login": login, "origin": f"https://{gw.host}:{gw.port}" if origin == "page" else origin}
     return {k: v for k, v in headers.items() if v}
 
 
@@ -147,6 +146,14 @@ async def test_limited_account_is_skipped_then_remembered(gw):
     assert resp.status == 200 and body.count(b"event: ") == 3
     await call(gw)
     assert [s["tok"] for s in gw.seen] == ["LIMITED", "GOOD", "GOOD"]
+
+
+async def test_a_session_moves_only_when_another_account_serves_it(gw):
+    use_accounts("GOOD", "THROTTLE")
+    await call(gw)  # s1 is served by good
+    hotpocket.POOL.block("good", "sk-ant-oat01-GOOD", "limit", time.time() + 60)
+    assert (await call(gw))[0].status == 429  # throttle refuses it, so nothing served it
+    assert hotpocket.POOL.sessions["s1"][0] == "good"  # and its prompt cache is still on good
 
 
 async def test_responses_stream_through_as_they_arrive(gw):
@@ -204,6 +211,12 @@ async def test_all_accounts_limited_looks_like_a_usage_limit(gw):
     resp, _ = await call(gw)
     assert resp.status == 429 and resp.headers[U + "status"] == "rejected"
     assert int(resp.headers[U + "reset"]) > time.time() + 7000
+    # With several, Claude Code hears about the one back first: when, and which of its limits it hit.
+    use_accounts("A", "B")
+    hotpocket.POOL.block("a", "sk-ant-oat01-A", "limit", time.time() + 5 * 86400, "seven_day")
+    hotpocket.POOL.block("b", "sk-ant-oat01-B", "limit", time.time() + 7200, "five_hour")
+    h = (await call(gw))[0].headers
+    assert h[U + "representative-claim"] == "five_hour" and int(h[U + "reset"]) < time.time() + 7300
 
 
 async def test_rejected_and_throttled_accounts_are_skipped(gw):
@@ -234,10 +247,23 @@ async def test_a_429_that_isnt_json_comes_back_as_an_api_error(gw, capsys):
     assert "(429: <html>slow down</html>)" in capsys.readouterr().out
 
 
+async def test_a_revoked_token_is_blocked_and_any_other_403_tries_the_next_account(gw):
+    # Anthropic answers a revoked token with a 403, which Claude Code would take for its own login revoked.
+    use_accounts("REVOKED", "NOMODEL", "GOOD")
+    assert (await call(gw))[0].status == 200 and [s["tok"] for s in gw.seen] == ["REVOKED", "NOMODEL", "GOOD"]
+    acc = (await status(gw))["accounts"]
+    assert acc["revoked"]["blocked_kind"] == "auth" and acc["nomodel"]["available"]  # that 403 was about the request
+    use_accounts("NOMODEL")
+    resp, body = await call(gw)
+    assert resp.status == 403 and b"NOMODEL says no" in body  # no account takes it: Anthropic's own answer
+
+
 async def test_rejected_token_is_403_and_its_replacement_used_at_once(gw):
     use_accounts("BAD")
     resp, body = await call(gw)
     assert resp.status == 403 and b"rejected" in body
+    hotpocket.POOL.accounts["bad"]["blocked_until"] = 0  # its block lapses, for a retry, but nothing was fixed
+    assert (await status(gw))["accounts"]["bad"]["blocked_kind"] == "auth"
     hotpocket.save_account("bad", "sk-ant-oat01-FIXED")
     assert (await call(gw))[0].status == 200 and gw.seen[-1]["tok"] == "FIXED"
 
@@ -253,6 +279,7 @@ async def test_truncated_upstream_stream_reaches_the_developer_as_an_error(gw, c
 # --------------------------------------------------------------------------- status
 
 async def test_open_status_pages_hear_when_usage_changes(gw):
+    assert (await gw.head("/_gateway/events")).status == 403  # not the stream: its reply would end at the headers
     events = await gw.get("/_gateway/events")
     assert events.headers["content-type"] == "text/event-stream"
     await call(gw)
@@ -304,6 +331,13 @@ async def test_status_shows_usage_blocks_and_developers_but_no_tokens_and_surviv
     assert hotpocket.Pool().accounts["limited"]["blocked_until"] > time.time()
 
 
+def test_a_streams_later_nulls_and_zeros_keep_its_counts():
+    start = b'{"message": {"model": "m", "usage": {"input_tokens": 100, "output_tokens": 1}}}'
+    delta = b'{"usage": {"input_tokens": null, "cache_read_input_tokens": 0, "output_tokens": 50}}'
+    reply = b"event: message_start\ndata: " + start + b"\n\nevent: message_delta\ndata: " + delta
+    assert hotpocket.usage_of(reply) == ("m", {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 0})
+
+
 def test_a_window_past_its_reset_reads_zero():
     assert hotpocket.used({"five_hour": 0.9, "five_hour_reset": time.time() - 1}, "five_hour", time.time()) == 0
     assert hotpocket.used({}, "five_hour", time.time()) is None
@@ -313,12 +347,13 @@ def test_a_window_past_its_reset_reads_zero():
 
 async def test_the_page_learns_who_is_viewing_only_from_this_host(gw):
     snap = await status(gw, headers=as_user(gw, login="Admin@Example.com"))
-    assert snap["viewer"] == {"login": "admin@example.com", "https": True, "member": True, "admin": True}
+    assert snap["viewer"] == {"login": "admin@example.com", "member": True, "admin": True}
     assert not hotpocket.viewer("100.64.0.9", as_user(gw))["admin"]
 
 
 async def test_managing_needs_https_from_the_page_and_admin_for_accounts(gw):
-    for who in ({"https": False}, {"origin": "https://evil.example"}, {"origin": None}, {"login": None}):
+    for who in ({"origin": f"http://{gw.host}:{gw.port}"}, {"origin": "https://evil.example"}, {"origin": None},
+                {"login": None}):
         for method, path in (("PUT", "accounts/web"), ("POST", "my-key")):
             assert (await manage(gw, method, path, {"token": TOKEN}, **who))[0] == 403, (path, who)
     assert (await manage(gw, "PUT", "accounts/web", {"token": TOKEN}, login="bob@x.com"))[0] == 403

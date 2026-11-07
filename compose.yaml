@@ -15,6 +15,7 @@ services:
     cap_add: [net_admin]
     configs: [{source: serve, target: /serve.json}]
     volumes: [tailscale:/var/lib/tailscale]
+    logging: {driver: local}               # rotates, like hotpocket's (Docker's default json-file never does)
     restart: unless-stopped
   hotpocket:
     build: .
