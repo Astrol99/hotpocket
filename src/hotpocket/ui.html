@@ -14,6 +14,7 @@ header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-be
 h1{font-size:22px;margin:0;letter-spacing:-.01em}
 h2{font-size:16px;margin:0}
 .head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:36px 0 6px}
+.head button+button{margin-left:6px}
 h3{font-size:14px;margin:0 0 2px}
 #who,.sub,.label{color:var(--mute);font-size:13px;font-weight:400}
 .note{background:var(--panel);border-radius:10px;padding:10px 14px;margin:16px 0 0}
@@ -58,6 +59,7 @@ body:not(.is-admin) .admin-only{display:none!important}
   tbody th,td[data-label=State],td[colspan],.actions{grid-column:1/-1}
   td[data-label]::before{content:attr(data-label);display:block;color:var(--mute);font-size:12px;margin-bottom:2px}
   .num,.actions{text-align:left}
+  .actions:empty{display:none}
   .meter{min-width:0}
 }
 </style>
@@ -67,11 +69,6 @@ body:not(.is-admin) .admin-only{display:none!important}
 <p id="offline" class="note bad" hidden>Can't reach the gateway. Retrying…</p>
 <p id="access" class="note" hidden></p>
 <div id="tiles" class="tiles"></div>
-<div id="mine" class="panel" hidden>
-  <h3>Your key</h3>
-  <p id="mine-text" class="sub"></p>
-  <button id="mine-button" class="primary"></button>
-</div>
 
 <section>
   <div class="head"><h2>Accounts</h2><button class="admin-only" data-opens="account-form">Add account</button></div>
@@ -90,7 +87,8 @@ body:not(.is-admin) .admin-only{display:none!important}
 </section>
 
 <section>
-  <div class="head"><h2>Developers</h2><button class="admin-only" data-opens="key-form">Add developer</button></div>
+  <div class="head"><h2>Developers</h2><span><button id="mine-button" class="primary" hidden>Get my key</button><button
+    class="admin-only" data-opens="key-form">Add developer</button></span></div>
   <div class="wrap"><table id="developers"></table></div>
   <div id="reveal" class="panel" hidden>
     <h3 id="reveal-title"></h3>
@@ -240,9 +238,11 @@ function devRow(d) {
     h('td', {class: 'num', 'data-label': 'Requests'}, d.requests),
     h('td', {title: clock(d.last_seen), 'data-label': 'Last seen'}, ago(d.last_seen)),
     h('td', {'data-label': 'Last account'}, d.last_account || '–'),
-    h('td', {class: 'actions admin-only'},
-      h('button', {onclick: e => makeKey(e.target, d.name, true)}, 'New key'),
-      h('button', {class: 'bad', onclick: e => removeDev(e.target, d.name)}, 'Remove')));
+    // Your own row has "New key" (to set up again or replace a lost key); admins can do it for anyone.
+    h('td', {class: 'actions'},
+      d.name === snap.viewer.login ? h('button', {onclick: e => newMyKey(e.target)}, 'New key')
+        : snap.viewer.admin ? h('button', {onclick: e => makeKey(e.target, d.name, true)}, 'New key') : null,
+      snap.viewer.admin ? h('button', {class: 'bad', onclick: e => removeDev(e.target, d.name)}, 'Remove') : null));
 }
 
 function accessNote(v) {
@@ -252,16 +252,9 @@ function accessNote(v) {
 // The developer (each one has a key) under this name, if any.
 const keyOf = name => snap.developers.find(d => d.name === name);
 
-// The signed-in visitor's own key: get one, or replace a lost one.
+// "Get my key" for anyone signed in who has none yet; once they do, their row has "New key".
 function renderMine(v) {
-  $('#mine').hidden = !v.member;
-  if (!v.member) return;
-  const d = keyOf(v.login);
-  $('#mine-text').textContent = d
-    ? `You have a key (${d.last_seen ? `${plural(d.requests, 'request')}, last used ${ago(d.last_seen)}` : 'not used yet'}). ` +
-      'Lost it, or setting up again? Get a new key; the old one stops working.'
-    : `Get a key to use Claude Code through hotpocket. It’s tied to your Tailscale login, ${v.login}.`;
-  $('#mine-button').textContent = d ? 'New key' : 'Get my key';
+  $('#mine-button').hidden = !v.member || Boolean(keyOf(v.login));
 }
 
 function render() {
@@ -279,8 +272,7 @@ function render() {
                       h('th', {class: 'num', title: 'Active in the last hour'}, 'Sessions'),
                       h('th', {class: 'num'}, 'Requests'), h('th', {class: 'admin-only'})],
         accounts.map(accountRow), 'No accounts yet.');
-  table('#developers', ['Name', h('th', {class: 'num'}, 'Requests'), 'Last seen', 'Last account',
-                        h('th', {class: 'admin-only'})],
+  table('#developers', ['Name', h('th', {class: 'num'}, 'Requests'), 'Last seen', 'Last account', h('th')],
         developers.map(devRow), 'No developers yet.');
 }
 
@@ -345,26 +337,25 @@ If that "env" also sets ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY, remove them: 
 check it works by running \`claude -p "Reply with OK"\` and tell me what it printed, and that I need to restart \
 Claude Code to switch over.`;
 
-// Shows a new key once, as a setup prompt and a settings.json snippet: under "Your key" for your
-// own, under the developers table for one an admin made.
+// Shows a new key once, under the developers table, as a setup prompt and a settings.json snippet.
 function reveal(name, key, mine = false) {
-  const panel = $('#reveal'), after = mine ? $('#mine') : $('#developers').parentElement;
+  const panel = $('#reveal');
   const env = {ANTHROPIC_BASE_URL: location.origin, ANTHROPIC_AUTH_TOKEN: key};  // for no claude.ai login
   panel.dataset.name = name;
   $('#reveal-title').textContent = mine ? 'Your new key' : `Key for ${name}`;
   $('#reveal-prompt').textContent = setupPrompt(location.origin, key);
   $('#reveal-snippet').textContent = JSON.stringify({env}, null, 2);
   panel.querySelectorAll('[data-copy]').forEach(b => { b.textContent = 'Copy'; });
-  after.after(panel);
   panel.hidden = false;
   panel.scrollIntoView({block: 'nearest', behavior: 'smooth'});
 }
 
-$('#mine-button').addEventListener('click', e =>
-  act(e.target, keyOf(snap.viewer.login) && 'Make a new key? Your old one stops working right away.', async () => {
+const newMyKey = button =>
+  act(button, keyOf(snap.viewer.login) && 'Make a new key? Your old one stops working right away.', async () => {
     const r = await api('POST', 'my-key');
     reveal(r.name, r.key, true);
-  }));
+  });
+$('#mine-button').addEventListener('click', e => newMyKey(e.target));
 
 document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', async () => {
   await navigator.clipboard.writeText($('#' + b.dataset.copy).textContent);
