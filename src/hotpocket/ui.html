@@ -238,8 +238,10 @@ function poolUse(w, label) {
   const parts = snap.accounts.map((a, i) => ({v: Math.min(1, a[w] || 0) / n, color: color(i),
                                               name: `${a.label}: ${pct(Math.min(1, a[w] || 0))} of its limit used`}));
   const use = known ? sum(parts.map(p => p.v)) : null;
-  return tile(label, known ? pct(use) : '–', known ? left(use) + ' of usage limit total' : 'no data yet', use,
-              parts.filter(p => p.v > 0));
+  const t = tile(label, known ? pct(use) : '–', known ? left(use) + ' of usage limit total' : 'no data yet', use,
+                 parts.filter(p => p.v > 0));
+  if (known) t.title = parts.map(p => p.name).join('\n');  // hovering anywhere on the tile lists every account
+  return t;
 }
 
 function meterCell(a, w, label) {
