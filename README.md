@@ -61,6 +61,10 @@ Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts
 - **Developer keys:** anyone on your tailnet can get their own. So adding someone
   to the tailnet (or sharing the machine with them) gives them access, and removing
   them takes it away. Admins can also make keys for others and remove anyone.
+- **Usage:** how many tokens each account and developer used, and what that would cost
+  at API list prices (the seats themselves are flat-rate). Prices come from the
+  `genai-prices` package; a model it doesn't know yet counts as $0, so after new
+  models ship run `uv lock --upgrade-package genai-prices` and update.
 - Every change is logged with who made it: `docker compose logs -f hotpocket`.
   An update recreates the container and starts a new log, so save it first if you
   need the history.

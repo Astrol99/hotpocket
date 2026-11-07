@@ -2,3 +2,4 @@ __pycache__/
 .scratch/
 .env
 hotpocket.db*
+*.pid

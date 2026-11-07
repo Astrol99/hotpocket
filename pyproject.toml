@@ -2,10 +2,10 @@
 name = "hotpocket"
 version = "0.3.0"
 description = "One Claude Code endpoint for a team, backed by a pool of Claude accounts"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
-dependencies = ["aiohttp>=3.9"]
+dependencies = ["aiohttp>=3.9", "genai-prices>=0.2.1"]
 
 [project.scripts]
 hotpocket = "hotpocket:main"

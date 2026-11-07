@@ -20,7 +20,7 @@ TOKEN = "sk-ant-oat01-NEW"
 async def fake_api(request):
     """Answers by the token's suffix: LIMITED (usage limit), THROTTLE and SLOWDOWN (plain 429s, the
     second with retry-after), GARBLED (a 429 that isn't JSON), BAD (401), TRUNC (drops mid-stream),
-    SLOW. Others stream 3 events."""
+    SLOW, PLAIN (a reply that isn't streamed). Others stream a reply with token usage."""
     tok = request.headers.get("authorization", "").rsplit("-", 1)[-1]
     request.app[SEEN].append({"tok": tok, "path": request.path_qs, "headers": request.headers,
                               "body": await request.read()})
@@ -33,13 +33,18 @@ async def fake_api(request):
     if status != 200:
         return web.json_response({"type": "error", "error": {"message": f"{tok} says no"}}, status=status,
                                  headers=headers)
+    if tok == "PLAIN":
+        return web.json_response({"model": "claude-sonnet-5-5", "usage": {"input_tokens": 1000, "output_tokens": 100}})
     resp = web.StreamResponse(headers={
         "content-type": "text/event-stream", U + "status": "allowed",
         U + "5h-utilization": "0.42", U + "5h-reset": str(int(now + 3000)),
         U + "7d-utilization": "0.10", U + "7d-reset": str(int(now + 90000))})
     await resp.prepare(request)
-    for _ in range(3):
-        await resp.write(b"event: delta\ndata: {}\n\n")
+    usage = '{"input_tokens": 100, "cache_creation_input_tokens": 200, "cache_read_input_tokens": 1000, "output_tokens": 1}'
+    for event in (f'message_start\ndata: {{"type": "message_start", "message": {{"model": "claude-opus-5-5", "usage": {usage}}}}}',
+                  'content_block_delta\ndata: {"type": "content_block_delta"}',
+                  'message_delta\ndata: {"type": "message_delta", "usage": {"output_tokens": 50}}'):
+        await resp.write(f"event: {event}\n\n".encode())
         if tok == "TRUNC":
             request.transport.close()  # gone mid-stream, without the final chunk
             return resp
@@ -144,7 +149,7 @@ async def test_missing_or_wrong_key_is_403_never_401(gw):
 
 async def test_limited_account_is_skipped_then_remembered(gw):
     resp, body = await call(gw)
-    assert resp.status == 200 and body.count(b"event: delta") == 3
+    assert resp.status == 200 and body.count(b"event: ") == 3
     await call(gw)
     assert [s["tok"] for s in gw.seen] == ["LIMITED", "GOOD", "GOOD"]
 
@@ -258,6 +263,21 @@ async def test_truncated_upstream_stream_reaches_the_developer_as_an_error(gw, c
 
 
 # --------------------------------------------------------------------------- status
+
+async def test_tokens_and_estimated_api_cost_are_counted(gw):
+    await call(gw)  # streamed: Claude Opus 5.5, 100 in + 200 cache writes + 1000 cache reads + 50 out
+    good = (await status(gw))["accounts"]["good"]
+    assert good["tokens"] == {"input_tokens": 100, "output_tokens": 50, "cache_creation_input_tokens": 200,
+                              "cache_read_input_tokens": 1000}
+    assert good["cost"] == pytest.approx((100 * 4 + 200 * 5 + 1000 * 0.2 + 50 * 20) / 1e6)
+    use_accounts("PLAIN")
+    await call(gw)  # not streamed: Claude Sonnet 5.5, 1000 in + 100 out
+    snap = await status(gw)
+    assert snap["accounts"]["plain"]["cost"] == pytest.approx((1000 * 2 + 100 * 10) / 1e6)
+    alice = snap["developers"][0]
+    assert alice["requests"] == 2 and alice["tokens"]["input_tokens"] == 1100 and alice["cost"] == pytest.approx(0.0026 + 0.003)
+    assert time.time() - snap["since"] < 60
+
 
 async def test_status_shows_usage_blocks_and_developers_but_no_tokens_and_survives_a_restart(gw):
     await call(gw)

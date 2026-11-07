@@ -22,6 +22,7 @@ from pathlib import Path
 
 import aiohttp
 from aiohttp import web
+from genai_prices import extract_usage
 from multidict import CIMultiDict
 from yarl import URL
 
@@ -38,6 +39,7 @@ AUTH_FAIL_COOLDOWN = 600    # a token the API rejected (401)
 FALLBACK_BLOCK = 3600       # usage-limit rejection without a reset time
 SESSION_TTL = 6 * 3600
 MAX_BODY = 32 * 1024 * 1024  # the Messages API's own request size limit
+TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 REASONS = {"auth": "token rejected (401)", "limit": "usage limit reached"}
 
 # Account labels, developer names and admin logins. Developer names are often Tailscale logins
@@ -80,6 +82,30 @@ def used(a, window, now):
     """An account's use of a window (0-1, None if unknown). Once its reset time passes it is back to 0."""
     reset = a.get(window + "_reset")
     return 0 if reset is not None and reset <= now else a.get(window)
+
+
+def usage_of(reply):
+    """The model and token usage in a reply. Streamed (SSE), message_start has them and message_delta
+    updates the usage; any other reply is one JSON object. Replies without usage give {}."""
+    model, usage = None, {}
+    for line in reply.splitlines() if reply.startswith(b"event:") else [reply]:
+        if b'"usage"' in line:
+            try:
+                event = json.loads(line.removeprefix(b"data:"))
+                message = event.get("message", event)
+                model, usage = message.get("model", model), {**usage, **message["usage"]}
+            except (ValueError, AttributeError, KeyError, TypeError):
+                pass
+    return model, usage
+
+
+def api_cost(model, usage):
+    """What a reply would have cost at API list prices, from genai-prices (update it for new models).
+    The seats themselves are flat-rate; 0 for a model it doesn't know or a reply without usage."""
+    try:
+        return float(extract_usage({"model": model, "usage": usage}, provider_id="anthropic").calc_price().total_price)
+    except (LookupError, ValueError):
+        return 0.0
 
 
 def key_hash(key):
@@ -135,6 +161,7 @@ class Pool:
         self.accounts = saved.get("accounts", {})  # label -> usage, block and request count
         self.devs = saved.get("devs", {})
         self.sessions = {}                          # session id -> (label, last seen)
+        self.since = saved.get("since") or time.time()  # when token counting started
         self.dirty = False
 
     def _acct(self, label):
@@ -179,16 +206,18 @@ class Pool:
         hint = "; replace its token on the status page" if kind == "auth" else ""
         log(f"account {label}: {REASONS[kind]}{hint}; back in {until_text(until)}")
 
-    def served(self, label, dev):
-        self._acct(label)["requests"] += 1
-        d = self.devs.setdefault(dev, {"requests": 0})
-        d["requests"] += 1
+    def served(self, label, dev, model, usage):
+        d, cost = self.devs.setdefault(dev, {"requests": 0}), api_cost(model, usage)
+        for entry in (self._acct(label), d):  # the same tally per account and per developer
+            entry["requests"] += 1
+            entry["cost"] = entry.get("cost", 0) + cost
+            entry["tokens"] = Counter(entry.get("tokens"))
+            entry["tokens"].update({f: usage.get(f) or 0 for f in TOKEN_FIELDS})
         d["last_seen"], d["last_account"] = time.time(), label
         self.dirty = True
 
     def snapshot(self, accounts, keys):
         now = time.time()
-        active = Counter(l for l, seen in self.sessions.values() if seen > now - 3600)
         rows = []
         for label, token in accounts.items():
             a = self.accounts.get(label, {})
@@ -199,10 +228,11 @@ class Pool:
                 "blocked_reason": REASONS.get(a["blocked_kind"]) if blocked else None,
                 "blocked_until": a["blocked_until"] if blocked else None,
                 **{w: used(a, w, now) for w in WINDOWS}, **{w + "_reset": a.get(w + "_reset") for w in WINDOWS},
-                "usage_at": a.get("usage_at"), "requests": a.get("requests", 0), "active_sessions": active[label],
+                "usage_at": a.get("usage_at"), "requests": a.get("requests", 0),
+                "tokens": a.get("tokens", {}), "cost": a.get("cost", 0),
             })
         devs = [{"name": n, "requests": 0, **self.devs.get(n, {})} for n in keys]
-        return {"accounts": rows, "developers": devs}
+        return {"accounts": rows, "developers": devs, "since": self.since}
 
     def tick(self):
         """Every few seconds: forget idle sessions and save state if it changed."""
@@ -210,7 +240,7 @@ class Pool:
         self.sessions = {s: v for s, v in self.sessions.items() if v[1] > cutoff}
         if self.dirty:
             write("INSERT OR REPLACE INTO state VALUES ('pool', ?)",
-                  json.dumps({"accounts": self.accounts, "devs": self.devs}))
+                  json.dumps({"accounts": self.accounts, "devs": self.devs, "since": self.since}))
             self.dirty = False
 
 
@@ -307,8 +337,8 @@ async def proxy(request):
                     # the request just tries the next one, and gets this answer if none takes it.
                     plain_429 = (downstream_headers(resp.headers), error)
                 continue
-            out = await relay(request, resp, f"{tag} -> {label}")
-        POOL.served(label, dev)
+            out, reply = await relay(request, resp, f"{tag} -> {label}")
+        POOL.served(label, dev, *usage_of(reply))
         switched = f" (switched from {', '.join(tried[:-1])})" if len(tried) > 1 else ""
         log(f"{tag} -> {label} {resp.status} {time.time() - started:.1f}s{switched}")
         return out
@@ -338,11 +368,15 @@ def downstream_headers(headers):
 
 
 async def relay(request, resp, what):
-    """Stream the upstream response through as it arrives (SSE-friendly)."""
+    """Stream the upstream response through as it arrives (SSE-friendly); also returns a copy of it,
+    for the token counts in it."""
     out = web.StreamResponse(status=resp.status, reason=resp.reason, headers=downstream_headers(resp.headers))
+    reply, keep = bytearray(), resp.content_type in ("text/event-stream", "application/json")  # not downloads
     try:
         await out.prepare(request)
         async for chunk in resp.content.iter_any():
+            if keep:
+                reply += chunk
             await out.write(chunk)
         await out.write_eof()
     except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionResetError) as e:
@@ -351,7 +385,7 @@ async def relay(request, resp, what):
         # body is seen as a failure instead of a complete response.
         if request.transport is not None:
             request.transport.close()
-    return out
+    return out, reply
 
 
 def all_blocked(tag, accounts):

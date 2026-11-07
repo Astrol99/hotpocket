@@ -9,7 +9,7 @@
 @media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#111113;--fg:#f2f2f2;--mute:#a1a1a6;--line:#2c2c2e;--panel:#1c1c1f;--track:#2e2e33;--fill:#7c9dff;--ok:#4ac26b;--bad:#ff6b5e;--btn:#f2f2f2;--btn-fg:#111}}
 *{box-sizing:border-box}
 [hidden]{display:none!important}
-body{background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;margin:0 auto;padding:24px 16px 72px;max-width:1000px}
+body{background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;margin:0 auto;padding:24px 16px 72px;max-width:1160px}
 header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 16px}
 h1{font-size:22px;margin:0;letter-spacing:-.01em}
 h2{font-size:16px;margin:0}
@@ -141,6 +141,23 @@ const ago = ts => !ts ? 'never' : now() - ts < 60 ? 'just now' : span(now() - ts
 const clock = ts => ts ? new Date(ts * 1000).toLocaleString([], {weekday: 'short', hour: 'numeric', minute: '2-digit'}) : '';
 const pct = v => Math.round(v * 100) + '%';
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const left = v => pct(Math.max(0, 1 - v)) + ' left';
+const count = n => n.toLocaleString('en', {notation: 'compact', maximumFractionDigits: 1});
+const money = v => v.toLocaleString('en', {style: 'currency', currency: 'USD', notation: 'compact',
+                                         minimumFractionDigits: 2, maximumFractionDigits: 2});
+const sum = xs => xs.reduce((x, y) => x + y, 0);
+const tokens = t => sum(Object.values(t || {}));
+
+// Tokens used and their estimated cost at API prices (the seats themselves are flat-rate).
+function usageCell(x) {
+  const t = x.tokens || {};
+  return h('td', {class: 'num', 'data-label': 'Usage',
+                  title: `${count(t.input_tokens || 0)} input, ${count(t.output_tokens || 0)} output, ` +
+                         `${count(t.cache_read_input_tokens || 0)} cache reads, ` +
+                         `${count(t.cache_creation_input_tokens || 0)} cache writes`},
+           count(tokens(t)) + ' tokens',
+           h('div', {class: 'sub'}, `${money(x.cost || 0)} · ${plural(x.requests || 0, 'request')}`));
+}
 
 function toast(msg) {
   const t = $('#toast');
@@ -187,9 +204,9 @@ function tile(label, value, sub, use) {
 
 function poolUse(w, label) {
   const vals = snap.accounts.map(a => a[w]).filter(v => v != null);
-  const avg = vals.length ? vals.reduce((x, y) => x + y, 0) / vals.length : null;
+  const avg = vals.length ? sum(vals) / vals.length : null;
   return tile(label, avg == null ? '–' : pct(avg),
-              vals.length ? `average of ${plural(vals.length, 'account')}` : 'no data yet', avg);
+              vals.length ? `${left(avg)} · average of ${plural(vals.length, 'account')}` : 'no data yet', avg);
 }
 
 function meterCell(a, w, label) {
@@ -197,7 +214,7 @@ function meterCell(a, w, label) {
   if (v == null) return h('td', {class: 'sub', 'data-label': label}, 'no data yet');
   return h('td', {'data-label': label},
     h('div', {class: 'meter'}, bar(v, `${a.label} ${label} use`), h('span', {class: 'pct'}, pct(v))),
-    reset > now() ? h('div', {class: 'sub', title: clock(reset)}, 'resets ' + until(reset)) : null);
+    h('div', {class: 'sub', title: reset > now() ? clock(reset) : ''}, left(v) + (reset > now() ? ' · resets ' + until(reset) : '')));
 }
 
 function stateCell(a) {
@@ -219,23 +236,22 @@ function table(id, cols, rows, none) {
 function usageAge(a) {
   if (a.five_hour == null && a.seven_day == null || now() - a.usage_at < 600) return null;
   return h('div', {class: 'sub', title: clock(a.usage_at)},
-           a.usage_at ? 'usage as of ' + ago(a.usage_at) : 'usage from an earlier request');
+           a.usage_at ? 'usage as of ' + ago(a.usage_at) : 'usage from earlier');
 }
 
 function accountRow(a) {
   return h('tr', {},
     h('th', {scope: 'row'}, a.label, usageAge(a)), stateCell(a), meterCell(a, 'five_hour', '5-hour'), meterCell(a, 'seven_day', 'Weekly'),
-    h('td', {class: 'num', 'data-label': 'Sessions'}, a.active_sessions),
-    h('td', {class: 'num', 'data-label': 'Requests'}, a.requests),
+    usageCell(a),
     h('td', {class: 'actions admin-only'},
-      h('button', {onclick: () => replaceToken(a.label)}, 'Replace token'),
+      h('button', {onclick: () => replaceToken(a.label)}, 'New token'),
       h('button', {class: 'bad', onclick: e => removeAccount(e.target, a.label)}, 'Remove')));
 }
 
 function devRow(d) {
   return h('tr', {},
     h('th', {scope: 'row'}, d.name),
-    h('td', {class: 'num', 'data-label': 'Requests'}, d.requests),
+    usageCell(d),
     h('td', {title: clock(d.last_seen), 'data-label': 'Last seen'}, ago(d.last_seen)),
     h('td', {'data-label': 'Last account'}, d.last_account || '–'),
     // Your own row has "New key" (to set up again or replace a lost key); admins can do it for anyone.
@@ -266,13 +282,15 @@ function render() {
   $('#access').hidden = !note;
   renderMine(viewer);
 
-  $('#tiles').replaceChildren(poolUse('five_hour', '5-hour use'), poolUse('seven_day', 'Weekly use'));
+  const cost = sum(accounts.map(a => a.cost || 0)), all = sum(accounts.map(a => tokens(a.tokens)));
+  $('#tiles').replaceChildren(poolUse('five_hour', '5-hour use'), poolUse('seven_day', 'Weekly use'),
+    tile('Est. API cost', money(cost), `${count(all)} tokens since ` +
+         new Date(snap.since * 1000).toLocaleDateString([], {month: 'short', day: 'numeric'})));
 
-  table('#accounts', ['Account', 'State', '5-hour', 'Weekly',
-                      h('th', {class: 'num', title: 'Active in the last hour'}, 'Sessions'),
-                      h('th', {class: 'num'}, 'Requests'), h('th', {class: 'admin-only'})],
+  const usageHead = () => h('th', {class: 'num', title: 'Tokens, and what they would cost at API prices'}, 'Usage');
+  table('#accounts', ['Account', 'State', '5-hour', 'Weekly', usageHead(), h('th', {class: 'admin-only'})],
         accounts.map(accountRow), 'No accounts yet.');
-  table('#developers', ['Name', h('th', {class: 'num'}, 'Requests'), 'Last seen', 'Last account', h('th')],
+  table('#developers', ['Name', usageHead(), 'Last seen', 'Last account', h('th')],
         developers.map(devRow), 'No developers yet.');
 }
 
