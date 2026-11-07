@@ -35,9 +35,9 @@ tbody th{font-weight:600}
 .pct{min-width:3em;text-align:right}
 .ok{color:var(--ok)}.bad{color:var(--bad)}
 .actions{text-align:right}
-.more{padding:1px 9px;font-size:16px;line-height:1.3}
-.more,[data-opens]{border-color:transparent}
-.more:hover,[data-opens]:hover{background:var(--panel)}
+.more{padding:1px 9px;font-size:16px;line-height:1.3;border-color:transparent}
+.more:hover{background:var(--panel)}
+.icon{width:12px;height:12px;margin-right:6px;vertical-align:-1px;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
 .menu{padding:4px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);box-shadow:0 8px 24px rgb(0 0 0/.18);text-align:left}
 .menu button{display:block;width:100%;text-align:left;border:0;background:none;padding:7px 12px}
 .menu button:hover{background:var(--panel)}
@@ -79,7 +79,7 @@ body:not(.is-admin) .admin-only{display:none!important}
 <div id="tiles" class="tiles"></div>
 
 <section>
-  <div class="head"><h2>Accounts</h2><button class="admin-only" data-opens="account-form">Add account</button></div>
+  <div class="head"><h2>Accounts</h2><button class="admin-only" data-opens="account-form"><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 1.5v9M1.5 6h9"/></svg>Add account</button></div>
   <div class="wrap"><table id="accounts"></table></div>
   <form id="account-form" class="panel admin-only" autocomplete="off" hidden>
     <h3>Add an account, or replace its token</h3>
@@ -96,7 +96,7 @@ body:not(.is-admin) .admin-only{display:none!important}
 
 <section>
   <div class="head"><h2>Developers</h2><span><button id="mine-button" class="primary" hidden>Get my key</button><button
-    class="admin-only" data-opens="key-form">Add developer</button></span></div>
+    class="admin-only" data-opens="key-form"><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 1.5v9M1.5 6h9"/></svg>Add developer</button></span></div>
   <div class="wrap"><table id="developers"></table></div>
   <div id="reveal" class="panel" hidden>
     <h3 id="reveal-title"></h3>
