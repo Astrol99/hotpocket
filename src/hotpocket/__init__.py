@@ -22,6 +22,7 @@ from pathlib import Path
 
 import aiohttp
 from aiohttp import web
+from multidict import CIMultiDict
 from yarl import URL
 
 DATA = Path(os.environ.get("HOTPOCKET_DATA", "/var/lib/hotpocket"))  # holds hotpocket.db
@@ -33,12 +34,11 @@ OAUTH_BETA = "oauth-2025-04-20"
 UNIFIED = "anthropic-ratelimit-unified-"
 WINDOWS = {"five_hour": "5h", "seven_day": "7d"}  # our field name -> header infix
 STICKY_MAX_UTIL = 0.95      # move a session off its account above this utilization
-THROTTLE_COOLDOWN = 60      # an ordinary 429 that gives no retry-after
 AUTH_FAIL_COOLDOWN = 600    # a token the API rejected (401)
 FALLBACK_BLOCK = 3600       # usage-limit rejection without a reset time
 SESSION_TTL = 6 * 3600
 MAX_BODY = 32 * 1024 * 1024  # the Messages API's own request size limit
-REASONS = {"auth": "token rejected (401)", "limit": "usage limit reached", "throttle": "throttled (429)"}
+REASONS = {"auth": "token rejected (401)", "limit": "usage limit reached"}
 
 # Account labels, developer names and admin logins. Developer names are often Tailscale logins
 # (you@example.com, you@github); all-dot names are refused because "." and ".." break URLs.
@@ -141,9 +141,11 @@ class Pool:
         return self.accounts.setdefault(label, {"requests": 0})
 
     def blocked(self, label, token, now):
-        # A block belongs to the token that earned it, so replacing a token clears it.
+        # A block belongs to the token that earned it, so replacing a token clears it. A kind no longer
+        # in REASONS (an old "throttle" block from saved state) doesn't count.
         a = self.accounts.get(label, {})
-        return a.get("blocked_until", 0) > now and a.get("blocked_token") == key_hash(token)[:16]
+        return (a.get("blocked_until", 0) > now and a.get("blocked_token") == key_hash(token)[:16]
+                and a.get("blocked_kind") in REASONS)
 
     def _util(self, label):
         a, now = self.accounts.get(label, {}), time.time()
@@ -275,7 +277,7 @@ async def proxy(request):
     session = request.headers.get("x-claude-code-session-id") or f"dev:{dev}"
     headers = upstream_headers(request.headers)
     url = URL(UPSTREAM + request.raw_path, encoded=True)
-    tried = []
+    tried, plain_429 = [], None
     while (label := POOL.choose(accounts, session, tried)) is not None:
         tried.append(label)
         token = accounts[label]
@@ -291,36 +293,55 @@ async def proxy(request):
             POOL.observe(label, resp.headers)
             if resp.status in (401, 429):
                 try:
-                    await resp.read()  # drain the short error body so the connection can be reused
+                    error = await resp.read()  # also lets the connection be reused
                 except (aiohttp.ClientError, asyncio.TimeoutError):
-                    pass  # the status alone decides what happens next
+                    error = b""
                 if resp.status == 401:
                     POOL.block(label, token, "auth", time.time() + AUTH_FAIL_COOLDOWN)
                 elif resp.headers.get(UNIFIED + "status") == "rejected":
                     POOL.block(label, token, "limit", reset_time(resp.headers),
                                resp.headers.get(UNIFIED + "representative-claim"))
-                else:  # an ordinary rate limit: wait as long as the API asks
-                    retry = num(resp.headers, "retry-after")
-                    POOL.block(label, token, "throttle",
-                               time.time() + (max(retry, 1) if retry is not None else THROTTLE_COOLDOWN))
+                else:
+                    # Any other 429 can be about this request (say, a long context the plan doesn't
+                    # cover) rather than the account, so the account isn't blocked for everyone;
+                    # the request just tries the next one, and gets this answer if none takes it.
+                    plain_429 = (downstream_headers(resp.headers), error)
                 continue
             out = await relay(request, resp, f"{tag} -> {label}")
         POOL.served(label, dev)
         switched = f" (switched from {', '.join(tried[:-1])})" if len(tried) > 1 else ""
         log(f"{tag} -> {label} {resp.status} {time.time() - started:.1f}s{switched}")
         return out
+    if plain_429:
+        headers, error = plain_429
+        try:
+            message = str(json.loads(error)["error"]["message"])
+        except (ValueError, KeyError, TypeError):
+            message = None
+        log(f"{tag}: refused by {', '.join(tried)} "
+            f"(429: {(message or error.decode(errors='replace'))[:200]})")
+        if message is not None:  # Anthropic's own answer, with its retry-after and x-should-retry
+            headers.setdefault("content-type", "application/json")
+            return web.Response(status=429, body=error, headers=headers)
+        # Not Anthropic's JSON error (empty, or a proxy's HTML page): Claude Code gets one it can read.
+        headers.popall("content-type", None)
+        return api_error(429, "rate_limit_error", "hotpocket: every team account refused this request "
+                         "(429). Try again shortly.", headers=headers)
     return all_blocked(tag, accounts)
+
+
+def downstream_headers(headers):
+    # Per-account usage headers would make Claude Code warn about one account's
+    # limit while the pool still has room, so they are dropped.
+    return CIMultiDict((k, v) for k, v in headers.items()
+                       if k.lower() not in NOT_DOWNSTREAM and not k.lower().startswith(UNIFIED))
 
 
 async def relay(request, resp, what):
     """Stream the upstream response through as it arrives (SSE-friendly)."""
-    # Per-account usage headers would make Claude Code warn about one account's
-    # limit while the pool still has room, so they are dropped.
-    headers = [(k, v) for k, v in resp.headers.items()
-               if k.lower() not in NOT_DOWNSTREAM and not k.lower().startswith(UNIFIED)]
-    out = web.StreamResponse(status=resp.status, reason=resp.reason, headers=headers)
-    await out.prepare(request)
+    out = web.StreamResponse(status=resp.status, reason=resp.reason, headers=downstream_headers(resp.headers))
     try:
+        await out.prepare(request)
         async for chunk in resp.content.iter_any():
             await out.write(chunk)
         await out.write_eof()
@@ -347,18 +368,14 @@ def all_blocked(tag, accounts):
     if kinds == {"auth"}:
         return api_error(403, "permission_error", "hotpocket: every team account token was "
                          "rejected. Ask your admin to replace them.")
-    if "limit" in kinds:
-        # Shaped like a subscription usage limit so Claude Code shows its normal
-        # "limit reached, resets at ..." message (and can wait for the reset).
-        claim = next((b["blocked_claim"] for b in timed if b.get("blocked_claim")), "five_hour")
-        return api_error(429, "rate_limit_error",
-                         f"hotpocket: all {len(blocks)} team accounts are at their usage limit "
-                         f"or unavailable. The first one is back in {until_text(reset)}.",
-                         headers={UNIFIED + "status": "rejected", UNIFIED + "reset": str(math.ceil(reset)),
-                                  UNIFIED + "representative-claim": claim, **retry})
+    # Shaped like a subscription usage limit so Claude Code shows its normal
+    # "limit reached, resets at ..." message (and can wait for the reset).
+    claim = next((b["blocked_claim"] for b in timed if b.get("blocked_claim")), "five_hour")
     return api_error(429, "rate_limit_error",
-                     f"hotpocket: all team accounts are briefly throttled. Retry in {until_text(reset)}.",
-                     headers=retry)
+                     f"hotpocket: all {len(blocks)} team accounts are at their usage limit "
+                     f"or unavailable. The first one is back in {until_text(reset)}.",
+                     headers={UNIFIED + "status": "rejected", UNIFIED + "reset": str(math.ceil(reset)),
+                              UNIFIED + "representative-claim": claim, **retry})
 
 
 # --------------------------------------------------------------------------- status page

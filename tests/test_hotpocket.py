@@ -19,16 +19,20 @@ TOKEN = "sk-ant-oat01-NEW"
 
 async def fake_api(request):
     """Answers by the token's suffix: LIMITED (usage limit), THROTTLE and SLOWDOWN (plain 429s, the
-    second with retry-after), BAD (401), TRUNC (drops mid-stream), SLOW. Others stream 3 events."""
+    second with retry-after), GARBLED (a 429 that isn't JSON), BAD (401), TRUNC (drops mid-stream),
+    SLOW. Others stream 3 events."""
     tok = request.headers.get("authorization", "").rsplit("-", 1)[-1]
     request.app[SEEN].append({"tok": tok, "path": request.path_qs, "headers": request.headers,
                               "body": await request.read()})
     now = time.time()
     status, headers = {"LIMITED": (429, {U + "status": "rejected", U + "reset": str(int(now + 7200))}),
-                       "THROTTLE": (429, {}), "SLOWDOWN": (429, {"retry-after": "2"}), "BAD": (401, {})
-                       }.get(tok, (200, {}))
+                       "THROTTLE": (429, {}), "SLOWDOWN": (429, {"retry-after": "2", "x-should-retry": "false"}),
+                       "BAD": (401, {})}.get(tok, (200, {}))
+    if tok == "GARBLED":
+        return web.Response(status=429, text="<html>slow down</html>", content_type="text/html")
     if status != 200:
-        return web.json_response({"type": "error", "error": {}}, status=status, headers=headers)
+        return web.json_response({"type": "error", "error": {"message": f"{tok} says no"}}, status=status,
+                                 headers=headers)
     resp = web.StreamResponse(headers={
         "content-type": "text/event-stream", U + "status": "allowed",
         U + "5h-utilization": "0.42", U + "5h-reset": str(int(now + 3000)),
@@ -206,15 +210,35 @@ async def test_rejected_and_throttled_accounts_are_skipped(gw):
     use_accounts("BAD", "THROTTLE", "GOOD")
     assert (await call(gw))[0].status == 200 and [s["tok"] for s in gw.seen] == ["BAD", "THROTTLE", "GOOD"]
     acc = (await status(gw))["accounts"]
-    assert acc["bad"]["blocked_kind"] == "auth" and acc["throttle"]["blocked_kind"] == "throttle"
+    assert acc["bad"]["blocked_kind"] == "auth" and acc["throttle"]["available"]  # a plain 429 blocks no one
 
 
-@pytest.mark.parametrize("suffix, wait", [("THROTTLE", 60), ("SLOWDOWN", 2)])  # SLOWDOWN sends retry-after
-async def test_all_throttled_is_a_plain_retryable_429(gw, suffix, wait):
-    use_accounts(suffix)
+@pytest.mark.parametrize("suffixes", [["THROTTLE"], ["SLOWDOWN"], ["THROTTLE", "SLOWDOWN"]])
+async def test_a_429_from_every_account_comes_back_as_is_and_blocks_no_one(gw, capsys, suffixes):
+    # Such a 429 can be about the request itself, so one request mustn't lock everyone out.
+    use_accounts(*suffixes)
+    resp, body = await call(gw)
+    last = suffixes[-1]
+    assert resp.status == 429 and f"{last} says no".encode() in body and U + "status" not in resp.headers
+    assert resp.headers.get("retry-after") == ("2" if last == "SLOWDOWN" else None)  # Anthropic's, if any
+    assert resp.headers.get("x-should-retry") == ("false" if last == "SLOWDOWN" else None)
+    assert resp.content_type == "application/json"
+    assert all(a["available"] for a in (await status(gw))["accounts"].values())
+    assert f"(429: {last} says no)" in capsys.readouterr().out
+
+
+async def test_a_429_that_isnt_json_comes_back_as_an_api_error(gw, capsys):
+    use_accounts("GARBLED")
     resp, _ = await call(gw)
-    assert resp.status == 429 and U + "status" not in resp.headers and int(resp.headers["retry-after"]) <= wait
-    assert (await status(gw))["accounts"][suffix.lower()]["blocked_until"] < time.time() + wait + 1
+    assert resp.status == 429 and (await resp.json())["error"]["type"] == "rate_limit_error"
+    assert "(429: <html>slow down</html>)" in capsys.readouterr().out
+
+
+async def test_an_old_throttle_block_in_saved_state_blocks_no_one(gw):
+    hotpocket.POOL.block("good", "sk-ant-oat01-GOOD", "auth", time.time() + 60)
+    hotpocket.POOL.accounts["good"]["blocked_kind"] = "throttle"  # as saved before throttles stopped blocking
+    use_accounts("GOOD")
+    assert (await call(gw))[0].status == 200 and (await status(gw))["accounts"]["good"]["blocked_reason"] is None
 
 
 async def test_rejected_token_is_403_and_its_replacement_used_at_once(gw):
