@@ -259,9 +259,9 @@ function renderMine(v) {
   const d = keyOf(v.login);
   $('#mine-text').textContent = d
     ? `You have a key (${d.last_seen ? `${plural(d.requests, 'request')}, last used ${ago(d.last_seen)}` : 'not used yet'}). ` +
-      'Lost it? Replacing it stops the old one working.'
+      'Lost it, or setting up again? Get a new key; the old one stops working.'
     : `Get a key to use Claude Code through hotpocket. It’s tied to your Tailscale login, ${v.login}.`;
-  $('#mine-button').textContent = d ? 'Replace my key' : 'Get my key';
+  $('#mine-button').textContent = d ? 'New key' : 'Get my key';
 }
 
 function render() {
@@ -361,7 +361,7 @@ function reveal(name, key, mine = false) {
 }
 
 $('#mine-button').addEventListener('click', e =>
-  act(e.target, keyOf(snap.viewer.login) && 'Replace your key? The old one stops working right away.', async () => {
+  act(e.target, keyOf(snap.viewer.login) && 'Make a new key? Your old one stops working right away.', async () => {
     const r = await api('POST', 'my-key');
     reveal(r.name, r.key, true);
   }));
