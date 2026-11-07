@@ -219,7 +219,7 @@ function tile(label, value, sub, use) {
 function poolUse(w, label) {
   const n = snap.accounts.length, known = snap.accounts.some(a => a[w] != null);
   const use = known ? sum(snap.accounts.map(a => Math.min(1, a[w] || 0))) / n : null;
-  return tile(label, known ? pct(use) : '–', known ? left(use) : 'no data yet', use);
+  return tile(label, known ? pct(use) : '–', known ? left(use) + ' of usage limit total' : 'no data yet', use);
 }
 
 function meterCell(a, w, label) {
@@ -309,7 +309,7 @@ function render() {
   renderMine(viewer);
 
   const cost = sum(accounts.map(a => a.cost || 0)), all = sum(accounts.map(a => tokens(a.tokens)));
-  $('#tiles').replaceChildren(poolUse('five_hour', '5-hour usage limit total'), poolUse('seven_day', 'Weekly usage limit total'),
+  $('#tiles').replaceChildren(poolUse('five_hour', '5-hour'), poolUse('seven_day', 'Weekly'),
     tile('Est. API cost', money(cost), `${count(all)} tokens since ` +
          new Date(snap.since * 1000).toLocaleDateString([], {month: 'short', day: 'numeric'})));
 
