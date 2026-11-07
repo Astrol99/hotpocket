@@ -1,4 +1,5 @@
-# hotpocket and the Tailscale node it's reached through. Start or update: docker compose up -d --build
+# hotpocket and the Tailscale node it's reached through. Start or update (the prune deletes the replaced image):
+#   docker compose up -d --build && docker image prune -f --filter label=com.docker.compose.project=hotpocket
 services:
   tailscale:
     image: tailscale/tailscale:v1.104.4

@@ -41,7 +41,8 @@ in `.env`:
 ```sh
 git clone https://github.com/Astrol99/hotpocket && cd hotpocket
 echo TS_AUTHKEY=tskey-auth-... > .env
-docker compose up -d --build        # also how you update: git pull, then this again
+# Start it; update the same way after a git pull. The prune deletes the image an update replaces.
+docker compose up -d --build && docker image prune -f --filter label=com.docker.compose.project=hotpocket
 ```
 
 Without a key, open the newest link from `docker compose logs -f tailscale`; the
