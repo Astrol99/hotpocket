@@ -44,6 +44,7 @@ label.grow{flex:1;min-width:220px}
 input{font:inherit;font-size:14px;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
 code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;overflow-x:auto;margin:10px 0}
+#reveal-prompt{white-space:pre-wrap}
 .toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--btn);color:var(--btn-fg);padding:8px 14px;border-radius:10px;font-size:14px;max-width:calc(100% - 32px)}
 .dim{color:var(--mute)}
 body:not(.is-admin) .admin-only{display:none!important}
@@ -93,10 +94,14 @@ body:not(.is-admin) .admin-only{display:none!important}
   <div class="wrap"><table id="developers"></table></div>
   <div id="reveal" class="panel" hidden>
     <h3 id="reveal-title"></h3>
-    <p class="sub">Copy it now: it won't be shown again. It goes in <code>~/.claude/settings.json</code>
-      (merge it into the <code>env</code> section if you already have one); then run <code>claude</code> as usual.</p>
+    <p class="sub">Copy it now: it won't be shown again. Paste this into Claude Code and it sets itself up
+      (the prompt includes the key):</p>
+    <pre id="reveal-prompt"></pre>
+    <button class="primary" data-copy="reveal-prompt">Copy</button>
+    <p class="sub">Or add this to <code>~/.claude/settings.json</code> yourself (into its <code>env</code> section if
+      it has one), then restart <code>claude</code>:</p>
     <pre id="reveal-snippet"></pre>
-    <button id="reveal-copy" class="primary">Copy</button>
+    <button data-copy="reveal-snippet">Copy</button>
     <button id="reveal-done">Done</button>
   </div>
   <form id="key-form" class="panel admin-only" autocomplete="off" hidden>
@@ -327,15 +332,23 @@ const makeKey = (button, name, replacing) =>
   act(button, replacing && `Make a new key for ${name}? Their current key stops working.`,
       async () => reveal(name, (await api('POST', path('keys', name))).key));
 
-// Shows a new key once, with its settings.json snippet: under "Your key" for your own,
-// under the developers table for one an admin made.
+// A prompt that has Claude Code set itself up to use the gateway, and check that it works.
+const setupPrompt = env => `Set up Claude Code to use our team's Claude gateway, hotpocket. In ~/.claude/settings.json \
+(create it if it doesn't exist), add these to the top-level "env" object, keeping everything else in the file:
+${Object.entries(env).map(([k, v]) => `  "${k}": "${v}"`).join(',\n')}
+If that "env" also sets ANTHROPIC_API_KEY, remove it, since it would take priority. Then check it works by running \
+\`claude -p "Reply with OK"\` and tell me what it printed, and that I need to restart Claude Code to switch over.`;
+
+// Shows a new key once, as a setup prompt and a settings.json snippet: under "Your key" for your
+// own, under the developers table for one an admin made.
 function reveal(name, key, mine = false) {
   const panel = $('#reveal'), after = mine ? $('#mine') : $('#developers').parentElement;
+  const env = {ANTHROPIC_BASE_URL: location.origin, ANTHROPIC_AUTH_TOKEN: key};
   panel.dataset.name = name;
   $('#reveal-title').textContent = mine ? 'Your new key' : `Key for ${name}`;
-  $('#reveal-snippet').textContent = JSON.stringify(
-    {env: {ANTHROPIC_BASE_URL: location.origin, ANTHROPIC_AUTH_TOKEN: key}}, null, 2);
-  $('#reveal-copy').textContent = 'Copy';
+  $('#reveal-prompt').textContent = setupPrompt(env);
+  $('#reveal-snippet').textContent = JSON.stringify({env}, null, 2);
+  panel.querySelectorAll('[data-copy]').forEach(b => { b.textContent = 'Copy'; });
   after.after(panel);
   panel.hidden = false;
   panel.scrollIntoView({block: 'nearest', behavior: 'smooth'});
@@ -347,12 +360,12 @@ $('#mine-button').addEventListener('click', e =>
     reveal(r.name, r.key, true);
   }));
 
-$('#reveal-copy').addEventListener('click', async e => {
-  await navigator.clipboard.writeText($('#reveal-snippet').textContent);
-  e.target.textContent = 'Copied';
-});
+document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', async () => {
+  await navigator.clipboard.writeText($('#' + b.dataset.copy).textContent);
+  b.textContent = 'Copied';
+}));
 function hideReveal() {
-  $('#reveal-snippet').textContent = '';
+  $('#reveal-prompt').textContent = $('#reveal-snippet').textContent = '';
   $('#reveal').hidden = true;
 }
 $('#reveal-done').addEventListener('click', hideReveal);

@@ -22,9 +22,10 @@ over Tailscale, at `https://hotpocket.<your-tailnet>.ts.net`.
 ## For developers
 
 You need to be on the team's Tailscale network. Open
-`https://hotpocket.<your-tailnet>.ts.net`, click **Get my key**, and paste
-the snippet it shows into `~/.claude/settings.json`. Then run `claude` as usual;
-remove the snippet to go back to your own login.
+`https://hotpocket.<your-tailnet>.ts.net` and click **Get my key**. Paste the prompt
+it shows into Claude Code, which sets itself up and checks the connection (or paste
+the snippet into `~/.claude/settings.json` yourself). Then restart `claude`; remove
+those two settings to go back to your own login.
 
 - Use the full `.ts.net` name. The short `https://hotpocket` fails the HTTPS
   certificate check, and Claude Code just keeps retrying instead of showing an error.
