@@ -23,6 +23,7 @@ h3{font-size:14px;margin:0 0 2px}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:20px}
 .tile,.panel{background:var(--panel);border-radius:12px;padding:14px 16px}
 .panel{margin-top:14px}
+#dev-tiles{margin:12px 0 8px}
 .value{font-size:28px;font-weight:600;line-height:1.25;font-variant-numeric:tabular-nums}
 .wrap{overflow-x:auto}
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
@@ -103,6 +104,7 @@ body:not(.is-admin) .admin-only{display:none!important}
 <section>
   <div class="head"><h2>Developers</h2><span><button id="mine-button" class="primary" hidden>Get my key</button><button
     class="admin-only" data-opens="key-form"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>Add developer</button></span></div>
+  <div id="dev-tiles" class="tiles"></div>
   <div class="wrap"><table id="developers"></table></div>
   <div id="reveal" class="panel" hidden>
     <h3 id="reveal-title"></h3>
@@ -332,13 +334,13 @@ function render() {
 
   const cost = sum(accounts.map(a => a.cost || 0)), all = sum(accounts.map(a => tokens(a.tokens)));
   $('#tiles').replaceChildren(poolUse('five_hour', '5-hour'), poolUse('seven_day', 'Weekly'),
-    devUse('five_hour', '5-hour by developer'), devUse('seven_day', 'Weekly by developer'),
     tile('Est. API cost', money(cost), `${count(all)} tokens since ` +
          new Date(snap.since * 1000).toLocaleDateString([], {month: 'short', day: 'numeric'})));
 
   const usageHead = () => h('th', {class: 'num', title: 'Tokens, and what they would cost at API prices'}, 'Usage');
   table('#accounts', ['Account', 'State', '5-hour', 'Weekly', usageHead(), h('th', {class: 'admin-only'})],
         accounts.map(accountRow), 'No accounts yet.');
+  $('#dev-tiles').replaceChildren(devUse('five_hour', '5-hour by developer'), devUse('seven_day', 'Weekly by developer'));
   table('#developers', ['Name', usageHead(), 'Last seen', 'Last account', h('th')],
         developers.map(devRow), 'No developers yet.');
 }
