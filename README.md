@@ -56,7 +56,7 @@ access rules, also let the team reach it on ports 80 and 443, for example
 
 Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts.net`:
 
-- **Accounts:** paste a token from `claude setup-token` for each Claude account.
+- **Pool:** paste a token from `claude setup-token` for each Claude account in the pool.
   Saving under an existing label replaces its token, for example a rejected one.
 - **Developer keys:** anyone on your tailnet can get their own. So adding someone
   to the tailnet (or sharing the machine with them) gives them access, and removing

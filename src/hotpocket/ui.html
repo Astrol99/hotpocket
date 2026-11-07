@@ -86,7 +86,7 @@ body:not(.is-admin) .admin-only{display:none!important}
 <div id="tiles" class="tiles"></div>
 
 <section>
-  <div class="head"><h2>Accounts</h2><button class="admin-only" data-opens="account-form"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>Add account</button></div>
+  <div class="head"><h2>Pool</h2><button class="admin-only" data-opens="account-form"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>Add account</button></div>
   <div class="wrap"><table id="accounts"></table></div>
   <form id="account-form" class="panel admin-only" autocomplete="off" hidden>
     <h3>Add an account, or replace its token</h3>
@@ -339,7 +339,7 @@ function render() {
 
   const usageHead = () => h('th', {class: 'num', title: 'Tokens, and what they would cost at API prices'}, 'Usage');
   table('#accounts', ['Account', 'State', '5-hour', 'Weekly', usageHead(), h('th', {class: 'admin-only'})],
-        accounts.map(accountRow), 'No accounts yet.');
+        accounts.map(accountRow), 'No accounts in the pool yet.');
   $('#dev-tiles').replaceChildren(devUse('five_hour', '5-hour by developer'), devUse('seven_day', 'Weekly by developer'));
   table('#developers', ['Name', usageHead(), 'Last seen', 'Last account', h('th')],
         developers.map(devRow), 'No developers yet.');
