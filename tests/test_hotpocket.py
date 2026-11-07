@@ -264,6 +264,13 @@ async def test_truncated_upstream_stream_reaches_the_developer_as_an_error(gw, c
 
 # --------------------------------------------------------------------------- status
 
+async def test_open_status_pages_hear_when_usage_changes(gw):
+    events = await gw.get("/_gateway/events")
+    assert events.headers["content-type"] == "text/event-stream"
+    await call(gw)
+    assert await asyncio.wait_for(events.content.readline(), 5) == b"data: changed\n"
+
+
 async def test_tokens_and_estimated_api_cost_are_counted(gw):
     await call(gw)  # streamed: Claude Opus 5.5, 100 in + 200 cache writes + 1000 cache reads + 50 out
     good = (await status(gw))["accounts"]["good"]

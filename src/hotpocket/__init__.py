@@ -152,6 +152,16 @@ def key_names():
 
 
 # --------------------------------------------------------------------------- pool
+
+CHANGED = None  # set (and replaced) whenever usage changes; open status pages wait on it. None when stopped.
+
+
+def changed():
+    global CHANGED
+    if CHANGED:
+        CHANGED.set()
+        CHANGED = asyncio.Event()
+
 # Everything here runs on the event loop's single thread, so no locks are needed.
 
 class Pool:
@@ -203,6 +213,7 @@ class Pool:
         self._acct(label).update(blocked_kind=kind, blocked_until=until, blocked_claim=claim,
                                  blocked_token=key_hash(token)[:16])  # which token earned it
         self.dirty = True
+        changed()
         hint = "; replace its token on the status page" if kind == "auth" else ""
         log(f"account {label}: {REASONS[kind]}{hint}; back in {until_text(until)}")
 
@@ -215,6 +226,7 @@ class Pool:
             entry["tokens"].update({f: usage.get(f) or 0 for f in TOKEN_FIELDS})
         d["last_seen"], d["last_account"] = time.time(), label
         self.dirty = True
+        changed()
 
     def snapshot(self, accounts, keys):
         now = time.time()
@@ -436,6 +448,20 @@ def viewer(remote, headers):
     return {"login": login, "https": https, "member": member, "admin": admin}
 
 
+@routes.get("/_gateway/events")
+async def events(request):
+    """Server-sent events: tells an open status page when usage changes, so it refreshes right away."""
+    resp = web.StreamResponse(headers={"content-type": "text/event-stream", "cache-control": "no-store"})
+    await resp.prepare(request)
+    wake = CHANGED
+    while wake:
+        await wake.wait()
+        wake = CHANGED  # the next change to wait for (taken before writing, so none is missed); None at shutdown
+        if wake:
+            await resp.write(b"data: changed\n\n")
+    return resp
+
+
 @routes.get("/_gateway/status")
 async def status_json(request):
     snap = POOL.snapshot(load_accounts(), key_names())
@@ -560,11 +586,11 @@ def make_app():
                 log(f"could not save usage: {e}")
 
     async def lifespan(_app):
-        global POOL, CLIENT
+        global POOL, CLIENT, CHANGED
         # The server never waits long for the database: a stuck writer elsewhere (say an open
         # sqlite3 shell) would otherwise stall every stream. A failed usage save retries next tick.
         db().execute("PRAGMA busy_timeout = 1000")
-        POOL = Pool()
+        POOL, CHANGED = Pool(), asyncio.Event()
         CLIENT = aiohttp.ClientSession(
             auto_decompress=False,  # pass bytes through untouched
             skip_auto_headers=("Accept-Encoding", "User-Agent"),
@@ -582,7 +608,13 @@ def make_app():
     app = web.Application(client_max_size=MAX_BODY)
     app.add_routes(routes)
     app.router.add_route("*", "/{tail:.*}", proxy)  # everything else goes to the API
+    async def stop_events(_app):  # open status pages would otherwise hold up a restart for its full timeout
+        global CHANGED
+        CHANGED, wake = None, CHANGED
+        wake.set()
+
     app.cleanup_ctx.append(lifespan)
+    app.on_shutdown.append(stop_events)
     return app
 
 
