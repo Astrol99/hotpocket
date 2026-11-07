@@ -35,9 +35,9 @@ systemctl daemon-reload
 systemctl enable -q hotpocket
 systemctl restart hotpocket
 
-if ! health=$(curl -fs --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/_gateway/health); then
+if ! curl -fs -o /dev/null --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/api/hello; then
   echo "The service failed to start:" >&2
   journalctl -u hotpocket -n 20 --no-pager >&2
   exit 1
 fi
-echo "==> Gateway running: $health"
+echo "==> Gateway running"

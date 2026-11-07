@@ -14,3 +14,10 @@ hotpocket = "hotpocket:main"
 requires = ["uv_build>=0.11.3,<0.12"]
 build-backend = "uv_build"
 
+[dependency-groups]
+dev = ["pytest>=9.2.0", "pytest-aiohttp>=1.1.1"]
+
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
