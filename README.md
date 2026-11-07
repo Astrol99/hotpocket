@@ -46,8 +46,12 @@ docker compose exec hotpocket hotpocket admin add you@example.com   # your Tails
 ```
 
 Without a key, open the newest link from `docker compose logs -f tailscale`; the
-link changes every minute until it's used. Then, in the Tailscale admin console,
-turn off key expiry for the `hotpocket` machine.
+link changes every minute until it's used.
+
+In the Tailscale admin console, tag the `hotpocket` machine (say `tag:hotpocket`, or
+use an auth key with that tag) so it never expires. If your tailnet has its own
+access rules, also let the team reach it on ports 80 and 443, for example
+`{"action": "accept", "src": ["group:devs"], "dst": ["tag:hotpocket:80,443"]}`.
 
 Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts.net`:
 
