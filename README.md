@@ -166,3 +166,7 @@ tokens. Settings are environment variables: `HOTPOCKET_DATA` (default
 - `hardening.conf` re-enables `NoNewPrivileges`, `ProtectKernelTunables` and
   `ProtectControlGroups`, which the incus Ubuntu image turns off for every
   service by default.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
