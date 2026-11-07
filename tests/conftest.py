@@ -21,19 +21,28 @@ HOST = "hotpocket.example.ts.net"
 async def fake_api(request):
     """Answers by the token's suffix: LIMITED (usage limit), THROTTLE and SLOWDOWN (plain 429s, the
     second with retry-after), GARBLED (a 429 that isn't JSON), BAD (401), REVOKED and NOMODEL (403s),
-    TRUNC (drops mid-stream), SLOW, PLAIN (a reply that isn't streamed). Others stream a reply with token usage."""
-    tok = request.headers.get("authorization", "").rsplit("-", 1)[-1]
+    TRUNC (drops mid-stream), SLOW, PLAIN (a reply that isn't streamed); for API keys, SPENT (the monthly spend
+    cap's 429), BROKE (a 402), LOWBAL and CAPPED (out of credits, or at a set spend limit: 400s) and INVALID
+    (a 400 about the request). Others stream a reply with token usage."""
+    tok = (request.headers.get("x-api-key") or request.headers.get("authorization", "")).rsplit("-", 1)[-1]
     request.app[SEEN].append({"tok": tok, "path": request.path_qs, "headers": request.headers,
                               "body": await request.read()})
     now = time.time()
     status, headers = {"LIMITED": (429, {U + "status": "rejected", U + "reset": str(int(now + 7200))}),
                        "THROTTLE": (429, {}), "SLOWDOWN": (429, {"retry-after": "2", "x-should-retry": "false"}),
-                       "BAD": (401, {}), "REVOKED": (403, {}), "NOMODEL": (403, {})}.get(tok, (200, {}))
+                       "BAD": (401, {}), "REVOKED": (403, {}), "NOMODEL": (403, {}),
+                       "SPENT": (429, {}), "BROKE": (402, {}), "LOWBAL": (400, {}), "CAPPED": (400, {}),
+                       "INVALID": (400, {})}.get(tok, (200, {}))
     if tok == "GARBLED":
         return web.Response(status=429, text="<html>slow down</html>", content_type="text/html")
     if status != 200:
-        message = "OAuth token has been revoked." if tok == "REVOKED" else f"{tok} says no"  # the API's words
-        return web.json_response({"type": "error", "error": {"message": message}}, status=status, headers=headers)
+        message = {"REVOKED": "OAuth token has been revoked.",  # the API's words
+                   "SPENT": "You have reached your API usage limits: your organization has crossed its monthly API usage "
+                            "threshold, set based on your organization's API tier.",
+                   "LOWBAL": "Your credit balance is too low to access the Anthropic API.",
+                   "CAPPED": "You have reached your specified API usage limits."}.get(tok, f"{tok} says no")
+        details = {"details": {"error_code": "enforced_spend_limit_reached"}} if tok == "SPENT" else {}
+        return web.json_response({"type": "error", "error": {"message": message, **details}}, status=status, headers=headers)
     if tok == "PLAIN":
         return web.json_response({"model": "claude-sonnet-5-5", "usage": {"input_tokens": 1000, "output_tokens": 100}})
     resp = web.StreamResponse(headers={

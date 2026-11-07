@@ -94,11 +94,12 @@ function tile(label, value, sub, parts) {
 
 const noUsage = w => !snap.accounts.some(a => a[w] != null);
 
-// The pool's use of window w: every account's use (none heard yet counts as unused, and none counts past its
-// own limit) over the number of accounts, its bar split into each account's share of the pool's limit.
+// The pool's use of window w: every seat's use (none heard yet counts as unused, and none counts past its
+// own limit) over the number of seats, its bar split into each seat's share of the pool's limit.
 function poolUse(w, label) {
   if (noUsage(w)) return tile(label, '–', 'no data yet');
-  const parts = snap.accounts.map((a, i) => ({v: Math.min(1, a[w] || 0) / snap.accounts.length, color: color(i),
+  const seats = snap.accounts.filter(a => !a.api);  // an API key has credits, not 5-hour and weekly limits
+  const parts = seats.map((a, i) => ({v: Math.min(1, a[w] || 0) / seats.length, color: color(i),
     label: a.label, name: `${a.label}: ${pct(Math.min(1, a[w] || 0))} of its limit used`}));
   const use = sum(parts.map(p => p.v));
   return tile(label, pct(use), pct(Math.max(0, 1 - use)) + ' left of usage limit total', parts);
@@ -114,7 +115,7 @@ function devUse(w, label) {
 
 function meterCell(a, w, label) {
   const v = a[w], reset = a[w + '_reset'];
-  if (v == null) return h('td', {class: 'sub', 'data-label': label}, 'no data yet');
+  if (v == null) return h('td', {class: 'sub', 'data-label': label}, a.api ? '–' : 'no data yet');
   return h('td', {'data-label': label},
     h('div', {class: 'meter'}, bar([{v}], `${a.label} ${label} use`), h('span', {class: 'pct'}, pct(v))),
     reset > now() ? h('div', {class: 'sub', title: clock(reset)}, 'resets ' + until(reset)) : null);
@@ -135,9 +136,11 @@ function table(id, cols, rows, none) {
     h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', {colspan: cols.length, class: 'sub'}, none))));
 }
 
-// Usage is only heard in the API's replies, so it's as old as the account's last request through
-// hotpocket; use elsewhere (claude.ai, a direct login) doesn't show until then. Say so once it's stale.
-function usageAge(a) {
+// Under an account's label: an API key's credits used this month. A seat's usage is only heard in the API's
+// replies, so it's as old as its last request through hotpocket; use elsewhere (claude.ai, a direct login)
+// doesn't show until then. Say so once it's stale.
+function accountNote(a) {
+  if (a.api) return h('div', {class: 'sub'}, `API credits: ${money(a.month_cost)} used this month`);
   if (!a.usage_at || now() - a.usage_at < 600) return null;
   return h('div', {class: 'sub', title: clock(a.usage_at)}, 'usage as of ' + ago(a.usage_at));
 }
@@ -157,7 +160,7 @@ function menu(name, ...items) {
 
 function accountRow(a) {
   return h('tr', {},
-    h('th', {scope: 'row'}, a.label, usageAge(a)), stateCell(a), meterCell(a, 'five_hour', '5-hour'), meterCell(a, 'seven_day', 'Weekly'),
+    h('th', {scope: 'row'}, a.label, accountNote(a)), stateCell(a), meterCell(a, 'five_hour', '5-hour'), meterCell(a, 'seven_day', 'Weekly'),
     usageCell(a),
     h('td', {class: 'actions admin-only'}, menu(a.label,
       h('button', {onclick: () => replaceToken(a.label)}, icon('key-round'), 'New token'),

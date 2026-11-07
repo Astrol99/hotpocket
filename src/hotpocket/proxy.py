@@ -15,9 +15,9 @@ from multidict import CIMultiDict
 from yarl import URL
 
 from .pool import POOL
-from .store import key_owner, load_accounts
+from .store import is_api_key, key_owner, load_accounts
 from .tailscale import refused
-from .usage import UNIFIED, reset_time, usage_of
+from .usage import OUT_OF_CREDIT, UNIFIED, next_month, reset_time, usage_of
 
 log = logging.getLogger(__name__)
 
@@ -73,22 +73,21 @@ async def proxy(request):
         return api_error(503, "api_error", "hotpocket: no accounts configured.")
     body = await request.read()  # buffered so the request can be resent on another account
     session = request.headers.get("x-claude-code-session-id") or f"dev:{dev}"
-    headers = upstream_headers(request.headers)
     url = URL(UPSTREAM + request.rel_url.raw_path_qs, encoded=True)  # even "http://host/..." comes as just a path
     tried, turned = [], None
     while (label := pool.choose(accounts, session, tried)) is not None:
         tried.append(label)
-        headers["authorization"] = f"Bearer {accounts[label]}"
+        token = accounts[label]
         try:
-            resp = await request.app[CLIENT].request(request.method, url, headers=headers, data=body or None,
-                                                     allow_redirects=False)
+            resp = await request.app[CLIENT].request(request.method, url, data=body or None, allow_redirects=False,
+                                                     headers=upstream_headers(request.headers, token))
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning(f"{tag} -> {label}: upstream error {e!r}")
             return api_error(502, "api_error", f"hotpocket: could not reach the Anthropic API ({type(e).__name__}).")
         async with resp:
             pool.observe(label, resp.headers)
-            if resp.status in (401, 403, 429):
-                turned = await turned_down(pool, label, accounts[label], resp) or turned
+            if resp.status in (401, 403, 429) or (resp.status in (400, 402) and is_api_key(token)):
+                turned = await turned_down(pool, label, token, resp) or turned
                 continue
             out, reply = await relay(request, resp, f"{tag} -> {label}")
         pool.served(label, session, dev, *usage_of(reply))
@@ -111,12 +110,21 @@ def developer(headers):
     return key_owner(presented) if presented else None
 
 
-def upstream_headers(headers):
-    """The developer's headers, less their key, Tailscale's and the hop-by-hop ones, plus the OAuth beta."""
+def upstream_headers(headers, token):
+    """The developer's headers, less their key, Tailscale's and the hop-by-hop ones, with the account's token:
+    an API key as x-api-key, a seat's token as the bearer, with the beta that lets it call the API."""
     out = {k: v for k, v in headers.items()
            if k.lower() not in NOT_UPSTREAM and not k.lower().startswith(("tailscale-", "x-forwarded-"))}
-    betas = [b.strip() for v in headers.getall("anthropic-beta", []) for b in v.split(",")]
-    out["anthropic-beta"] = ",".join(dict.fromkeys([b for b in betas if b] + [OAUTH_BETA]))
+    # A developer logged in to claude.ai sends the OAuth beta too; it goes up only with a seat's token.
+    betas = [b for v in headers.getall("anthropic-beta", []) for b in map(str.strip, v.split(","))
+             if b and b != OAUTH_BETA]
+    if is_api_key(token):
+        out["x-api-key"] = token
+    else:
+        out["authorization"] = f"Bearer {token}"
+        betas.append(OAUTH_BETA)
+    if betas:
+        out["anthropic-beta"] = ",".join(dict.fromkeys(betas))
     return out
 
 
@@ -128,18 +136,21 @@ def downstream_headers(headers):
 
 
 async def turned_down(pool, label, token, resp):
-    """An account turned a request down (401, 403 or 429). Blocks the account if it's about the account;
-    returns the API's answer if it may be about the request, for when no account takes it."""
+    """An account turned a request down. Blocks the account if it's about the account; returns the API's
+    answer if it may be about the request, for when no account takes it."""
     try:
         error = await resp.read()  # also lets the connection be reused
     except (aiohttp.ClientError, asyncio.TimeoutError):
         error = b""
     if resp.status == 401 or b"OAuth token has been revoked" in error:  # a revoked token gets a 403
         pool.block(label, token, "auth")
-    elif resp.headers.get(UNIFIED + "status") == "rejected":
+    elif resp.headers.get(UNIFIED + "status") == "rejected":  # a seat's usage limit (API keys have no such header)
         pool.block(label, token, "limit", reset_time(resp.headers), resp.headers.get(UNIFIED + "representative-claim"))
+    elif is_api_key(token) and (resp.status == 402 or ("retry-after" not in resp.headers
+                                                       and any(s in error for s in OUT_OF_CREDIT))):
+        pool.block(label, token, "credit", next_month())  # its monthly credits or spend limit are used up
     else:
-        # Any other 403 or 429 can be about this request (say, a model or a long context the plan doesn't
+        # Any other refusal can be about this request (say, a model or a long context the plan doesn't
         # cover) or this account (its organization), so the account isn't blocked for everyone; the
         # request just tries the next one.
         return resp.status, downstream_headers(resp.headers), error

@@ -1,6 +1,7 @@
 """What the API's replies say about usage: each account's limits, in its rate-limit headers, and the
 tokens a reply used, with what they would cost at API prices."""
 
+import datetime
 import json
 import time
 
@@ -9,6 +10,8 @@ from genai_prices import extract_usage
 UNIFIED = "anthropic-ratelimit-unified-"  # the subscription's rate-limit headers
 WINDOWS = {"five_hour": "5h", "seven_day": "7d"}  # our name for each limit -> its header infix
 FALLBACK_BLOCK = 3600  # how long a usage-limit rejection without a reset time blocks an account
+# An API key's answers when its credits or spend limit are used up (a 402 billing_error, or these in a 429 or 400).
+OUT_OF_CREDIT = (b"enforced_spend_limit_reached", b"credit balance", b"reached your specified")
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 
@@ -24,6 +27,12 @@ def limits(headers):
     found = ((window + suffix, num(headers, f"{UNIFIED}{infix}-{name}"))
              for window, infix in WINDOWS.items() for suffix, name in (("", "utilization"), ("_reset", "reset")))
     return {key: value for key, value in found if value is not None}
+
+
+def next_month():
+    """00:00 UTC on the 1st of next month, when a spent API key's monthly credits and limits come back."""
+    now = datetime.datetime.now(datetime.UTC)
+    return datetime.datetime(now.year + now.month // 12, now.month % 12 + 1, 1, tzinfo=datetime.UTC).timestamp()
 
 
 def reset_time(headers):

@@ -8,6 +8,7 @@ import pytest
 
 from hotpocket import store
 from hotpocket.usage import UNIFIED as U
+from hotpocket.usage import next_month
 
 from conftest import block, call, dev, status, toks, use_accounts
 
@@ -179,3 +180,53 @@ async def test_rejected_token_is_403_and_its_replacement_used_at_once(gw):
     assert resp.status == 403 and b"rejected" in body
     store.save_account("bad", "sk-ant-oat01-FIXED")  # same label, new token: a block belongs to the token
     assert (await call(gw))[0].status == 200 and toks(gw)[-1] == "FIXED"
+
+
+# --------------------------------------------------------------------------- an API key's credits
+
+async def test_an_api_key_is_used_only_when_every_seat_is_out(gw):
+    store.save_account("credits", "sk-ant-api03-CREDITS")
+    await call(gw)
+    assert toks(gw) == ["LIMITED", "GOOD"]  # seats first
+    block(gw, "GOOD", "limit", time.time() + 60)
+    oauth = {**dev(store.new_key("bob")), "anthropic-beta": "claude-code-20250219,oauth-2025-04-20"}  # on claude.ai
+    assert (await call(gw, oauth))[0].status == 200 and toks(gw)[-1] == "CREDITS"
+    sent = gw.seen[-1]["headers"]
+    assert sent["x-api-key"] == "sk-ant-api03-CREDITS" and "authorization" not in sent
+    assert sent["anthropic-beta"] == "claude-code-20250219"  # an API key needs no OAuth beta
+    assert (await status(gw))["accounts"]["credits"]["month_cost"] > 0
+    gw.pool.accounts["good"]["blocked_until"] = 0  # the seat is back
+    await call(gw)
+    assert toks(gw)[-1] == "GOOD"  # and the session with it
+
+
+async def test_a_seat_that_only_throttles_keeps_the_request_off_the_credits(gw):
+    use_accounts("THROTTLE")
+    store.save_account("credits", "sk-ant-api03-CREDITS")
+    assert (await call(gw))[0].status == 429 and toks(gw) == ["THROTTLE"]
+
+
+# Out of credits (the spend cap's 429, a 402, or a 400 saying so), the key waits for next month, and every account being out
+# looks like a usage limit; any other 400 is about the request, and comes back as is.
+@pytest.mark.parametrize("suffix, code, kind", [("SPENT", 429, "credit"), ("BROKE", 429, "credit"), ("LOWBAL", 429, "credit"),
+                                                ("CAPPED", 429, "credit"), ("INVALID", 400, None)])
+async def test_an_api_key_out_of_credits_waits_for_next_month(gw, suffix, code, kind):
+    use_accounts("LIMITED")
+    store.save_account("credits", f"sk-ant-api03-{suffix}")
+    assert (await call(gw))[0].status == code and toks(gw) == ["LIMITED", suffix]
+    credits = (await status(gw))["accounts"]["credits"]
+    assert credits.get("blocked_kind") == kind and credits.get("blocked_until", next_month()) == next_month()
+
+
+async def test_a_rejected_seat_gets_a_try_before_credits(gw):
+    # So if Anthropic rejects every seat's token for a while, credits fill in, and the seats are back once it recovers.
+    use_accounts("BAD")
+    store.save_account("credits", "sk-ant-api03-CREDITS")
+    for _ in range(2):
+        seen = len(gw.seen)
+        assert (await call(gw))[0].status == 200 and toks(gw, seen) == ["BAD", "CREDITS"]
+    use_accounts("GOOD")
+    store.save_account("credits", "sk-ant-api03-CREDITS")
+    block(gw, "GOOD", "auth")
+    seen = len(gw.seen)
+    assert (await call(gw))[0].status == 200 and toks(gw, seen) == ["GOOD"]

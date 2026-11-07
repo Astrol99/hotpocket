@@ -63,7 +63,10 @@ and 443, for example
 Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts.net`:
 
 - **Pool:** paste a token from `claude setup-token` for each Claude account in the pool.
-  Saving under an existing label replaces its token, for example a rejected one.
+  Saving under an existing label replaces its token, for example a rejected one. An API key
+  (`sk-ant-api…`) from the Claude Console can go in the pool too, say one with monthly credits:
+  hotpocket uses it only when every seat is at its limit, and once its credits or spend limit run
+  out, it waits for the next month.
 - **Developer keys:** anyone on your tailnet can get their own. So adding someone
   to the tailnet (or sharing the machine with them) gives them access, and removing
   them takes it away. Admins can also make keys for others and remove anyone.

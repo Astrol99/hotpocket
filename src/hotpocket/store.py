@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS state (name TEXT PRIMARY KEY, value TEXT NOT NULL);  
 # Account labels and developer names. Developer names are often Tailscale logins
 # (you@example.com, you@github); all-dot names are refused because "." and ".." break URLs.
 NAME_RE = re.compile(r"(?!\.+$)[\w.%+@-]{1,254}", re.ASCII)
-TOKEN_RE = re.compile(r"sk-ant-oat[0-9]*-[A-Za-z0-9_-]+")
+TOKEN_RE = re.compile(r"sk-ant-(?:oat|api)[0-9]*-[A-Za-z0-9_-]+")  # a seat's token, or a Console API key
 
 
 class EditError(Exception):
@@ -87,9 +87,14 @@ def save_account(label, raw_token):
     check_name(label, "Account")
     token = "".join(raw_token.split())
     if not TOKEN_RE.fullmatch(token):
-        raise EditError("That doesn't look like a Claude Code token (expected sk-ant-oat...).")
+        raise EditError("That's neither a Claude Code token (sk-ant-oat...) nor an API key (sk-ant-api...).")
     write("INSERT INTO accounts VALUES (?, ?, (SELECT IFNULL(MAX(position), 0) + 1 FROM accounts)) "
           "ON CONFLICT (label) DO UPDATE SET token = excluded.token", label, token)
+
+
+def is_api_key(token):
+    """A Claude Console API key, paid from credits, rather than a seat's subscription token."""
+    return token.startswith("sk-ant-api")
 
 
 def remove_account(label):

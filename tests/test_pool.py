@@ -28,9 +28,10 @@ async def test_tokens_and_estimated_api_cost_are_counted(gw):
 
 
 async def test_developers_share_the_pool_limits_by_what_their_requests_cost(gw):
+    store.save_account("credits", "sk-ant-api03-CREDITS")  # not a seat
     await call(gw)  # alice, on the good account: 42% of its 5-hour limit, 10% of its weekly
     alice = (await status(gw))["developers"]["alice"]
-    assert alice["five_hour"] == pytest.approx(0.42 / 2) and alice["seven_day"] == pytest.approx(0.10 / 2)  # 2 accounts
+    assert alice["five_hour"] == pytest.approx(0.42 / 2) and alice["seven_day"] == pytest.approx(0.10 / 2)  # 2 seats
     await call(gw, dev(store.new_key("bob")))  # bob's request costs the same, so they split it evenly
     devs = (await status(gw))["developers"]
     assert devs["alice"]["five_hour"] == devs["bob"]["five_hour"] == pytest.approx(0.42 / 2 / 2)

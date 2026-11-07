@@ -9,20 +9,21 @@ from collections import Counter
 from aiohttp import web
 from humanize import naturaldelta
 
-from .store import key_hash, key_names, load_accounts, save_usage, saved_usage
-from .usage import TOKEN_FIELDS, WINDOWS, api_cost, limits
+from .store import is_api_key, key_hash, key_names, load_accounts, save_usage, saved_usage
+from .usage import TOKEN_FIELDS, WINDOWS, api_cost, limits, next_month
 
 log = logging.getLogger(__name__)
 
 STICKY_MAX_UTIL = 0.95  # a session moves off its account above this use
 SESSION_TTL = 6 * 3600  # a session not seen for this long is forgotten
-REASONS = {"auth": "token rejected", "limit": "usage limit reached"}  # an account's blocked_kind
+REASONS = {"auth": "token rejected", "limit": "usage limit reached", "credit": "out of API credits"}  # blocked_kind
 
 
-def used(account, window, now):
-    """An account's use of a window (0-1, None if unknown). Once its reset time passes it is back to 0."""
-    reset = account.get(window + "_reset")
-    return 0 if reset is not None and reset <= now else account.get(window)
+def used(account, period, now):
+    """An account's tally for a period: a window's use (0-1, None if unknown), or the month's API cost. Once the
+    period's reset time passes it is back to 0."""
+    reset = account.get(period + "_reset")
+    return 0 if reset is not None and reset <= now else account.get(period)
 
 
 class Pool:
@@ -60,22 +61,29 @@ class Pool:
                 and (a.get("blocked_kind") == "auth" or a.get("blocked_until", 0) > now))
 
     def choose(self, accounts, session, exclude):
-        """The account for a request's next try (None when there's none left): its session's account
-        while that has room, else the one with the most."""
-        now = time.time()
-        left = [l for l in accounts if l not in exclude]
-        ready = [l for l in left if not self.blocked(l, accounts[l], now)]
-        if not ready:
-            # A rejected token is only tried again when nothing else is left (the request would fail anyway),
-            # so if Anthropic rejected every token at once, the pool is back as soon as it recovers. Only one
-            # per request, the longest-rejected first: revoked tokens cost a request one call, not one each.
-            rejected = [l for l in left if self.accounts[l].get("blocked_kind") == "auth"]
-            if not rejected or any(self.accounts.get(l, {}).get("blocked_kind") == "auth" for l in exclude):
-                return None
-            return min(rejected, key=lambda l: self.accounts[l]["blocked_until"])
-        sticky = self.sessions.get(session, (None,))[0]
-        return (sticky if sticky in ready and self._util(sticky) < STICKY_MAX_UTIL
-                else min(ready, key=self._util))  # ties go to the earlier-added account
+        """The account for a request's next try (None when there's none left): a seat, its session's while that
+        has room, else the one with the most; API credits only once every seat is blocked."""
+        now, left = time.time(), [l for l in accounts if l not in exclude]
+
+        def pick(labels):
+            ready = [l for l in labels if not self.blocked(l, accounts[l], now)]
+            if ready:
+                sticky = self.sessions.get(session, (None,))[0]
+                return (sticky if sticky in ready and self._util(sticky) < STICKY_MAX_UTIL
+                        else min(ready, key=self._util))  # ties go to the earlier-added account
+            # A rejected token is only tried again when nothing else is left here, so if Anthropic rejected every
+            # token at once, the pool is back as soon as it recovers. Only one per request, the longest-rejected
+            # first: revoked tokens cost a request one call, not one each.
+            rejected = [l for l in labels if self.accounts[l].get("blocked_kind") == "auth"]
+            if rejected and not any(self.accounts.get(l, {}).get("blocked_kind") == "auth" for l in exclude):
+                return min(rejected, key=lambda l: self.accounts[l]["blocked_until"])
+            return None
+
+        # A seat that turned this request down without being blocked (a plain 429, say) is still up: its answer
+        # goes back, rather than the request onto credits.
+        seat_up = any(not is_api_key(t) and not self.blocked(l, t, now) for l, t in accounts.items())
+        return (pick([l for l in left if not is_api_key(accounts[l])])
+                or (None if seat_up else pick([l for l in left if is_api_key(accounts[l])])))
 
     def first_back(self, labels):
         """When the first of these blocked accounts is back, and which limit it hit; None if every token
@@ -125,6 +133,7 @@ class Pool:
             entry["tokens"] = Counter(entry.get("tokens"))
             entry["tokens"].update({f: usage.get(f) or 0 for f in TOKEN_FIELDS})
         d["last_seen"], d["last_account"] = now, label
+        a["month_cost"], a["month_cost_reset"] = (used(a, "month_cost", now) or 0) + cost, next_month()  # API credits
         self.touch()
 
     # ------------------------------------------------------------------ the status page, and saving
@@ -132,21 +141,26 @@ class Pool:
     def snapshot(self, accounts, keys):
         """What the status page shows about the accounts and the developers (with these keys)."""
         now, rows, shares = time.time(), [], {w: Counter() for w in WINDOWS}
+        api = {label for label, token in accounts.items() if is_api_key(token)}  # credits, not seats with limits
+        seats = len(accounts) - len(api)
         for label, token in accounts.items():
             a = self.accounts.get(label, {})
             rows.append({
-                "label": label, **{w: used(a, w, now) for w in WINDOWS},
+                "label": label, "api": label in api, "month_cost": used(a, "month_cost", now) or 0,
+                **{w: used(a, w, now) for w in WINDOWS},
                 **{k: a.get(k) for k in ("usage_at", "requests", "tokens", "cost", *(w + "_reset" for w in WINDOWS))},
                 **({"blocked_kind": a["blocked_kind"], "blocked_reason": REASONS[a["blocked_kind"]],
                     "blocked_until": a["blocked_until"]} if self.blocked(label, token, now) else {}),
             })
+            if label in api:
+                continue  # credits aren't part of the seats' limits
             # Developers' shares of the pool's limits: the account's use in its current window, split between
             # the developers who used it by what their requests would cost at API prices.
             for w in WINDOWS:
                 spent, use = a.get("spent", {}).get(w), min(1, used(a, w, now) or 0)
                 if spent and (spent["reset"] or 0) > now and (total := sum(spent["devs"].values())):
                     for dev, cost in spent["devs"].items():
-                        shares[w][dev] += use * cost / total / len(accounts)
+                        shares[w][dev] += use * cost / total / seats
         devs = [{"name": n, **self.devs.get(n, {}), **{w: shares[w][n] for w in WINDOWS}} for n in keys]
         return {"accounts": rows, "developers": devs, "since": self.since}
 
