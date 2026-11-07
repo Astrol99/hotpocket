@@ -296,9 +296,16 @@ function accountRow(a) {
       h('button', {class: 'bad', onclick: e => removeAccount(e.target, a.label)}, icon('trash-2'), 'Remove'))));
 }
 
+// A developer's share of the pool's limit, an estimate: see shareHead.
+const shareCell = (d, w, label) => h('td', {'data-label': label},
+  h('div', {class: 'meter'}, bar(d[w] || 0, `${d.name} ${label} use`), h('span', {class: 'pct'}, pct(d[w] || 0))));
+const shareHead = label => h('th', {title: `Share of the pool's ${label.toLowerCase()} limit this developer used. ` +
+  "Estimated: each account's use is split between the developers who used it, by what their requests would cost."}, label);
+
 function devRow(d) {
   return h('tr', {},
     h('th', {scope: 'row'}, d.name),
+    shareCell(d, 'five_hour', '5-hour'), shareCell(d, 'seven_day', 'Weekly'),
     usageCell(d),
     h('td', {title: clock(d.last_seen), 'data-label': 'Last seen'}, ago(d.last_seen)),
     h('td', {'data-label': 'Last account'}, d.last_account || '–'),
@@ -340,7 +347,7 @@ function render() {
   const usageHead = () => h('th', {class: 'num', title: 'Tokens, and what they would cost at API prices'}, 'Usage');
   table('#accounts', ['Account', 'State', '5-hour', 'Weekly', usageHead(), h('th', {class: 'admin-only'})],
         accounts.map(accountRow), 'No accounts yet.');
-  table('#developers', ['Name', usageHead(), 'Last seen', 'Last account', h('th')],
+  table('#developers', ['Name', shareHead('5-hour'), shareHead('Weekly'), usageHead(), 'Last seen', 'Last account', h('th')],
         developers.map(devRow), 'No developers yet.');
 }
 

@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import functools
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -218,8 +219,13 @@ class Pool:
         log(f"account {label}: {REASONS[kind]}{hint}; back in {until_text(until)}")
 
     def served(self, label, dev, model, usage):
-        d, cost = self.devs.setdefault(dev, {"requests": 0}), api_cost(model, usage)
-        for entry in (self._acct(label), d):  # the same tally per account and per developer
+        d, a, cost, now = self.devs.setdefault(dev, {"requests": 0}), self._acct(label), api_cost(model, usage), time.time()
+        for w in WINDOWS:  # what each developer spent in the account's current windows, to split its use by
+            spent = a.setdefault("spent", {}).get(w)
+            if not spent or (spent["reset"] or 0) <= now:  # that window is over: this request starts the next
+                spent = a["spent"][w] = {"reset": a.get(w + "_reset"), "devs": {}}
+            spent["devs"][dev] = spent["devs"].get(dev, 0) + cost
+        for entry in (a, d):  # the same tally per account and per developer
             entry["requests"] += 1
             entry["cost"] = entry.get("cost", 0) + cost
             entry["tokens"] = Counter(entry.get("tokens"))
@@ -243,7 +249,16 @@ class Pool:
                 "usage_at": a.get("usage_at"), "requests": a.get("requests", 0),
                 "tokens": a.get("tokens", {}), "cost": a.get("cost", 0),
             })
-        devs = [{"name": n, "requests": 0, **self.devs.get(n, {})} for n in keys]
+        # A developer's share of the pool's limits: each account's use, split between the developers who
+        # used it in its current window by what their requests would cost at API prices.
+        shares = {w: Counter() for w in WINDOWS}
+        for label, w in itertools.product(accounts, WINDOWS):
+            a = self.accounts.get(label, {})
+            spent, use = a.get("spent", {}).get(w), min(1, used(a, w, now) or 0)
+            if spent and (spent["reset"] or 0) > now and (total := sum(spent["devs"].values())):
+                for dev, cost in spent["devs"].items():
+                    shares[w][dev] += use * cost / total / len(accounts)
+        devs = [{"name": n, "requests": 0, **self.devs.get(n, {}), **{w: shares[w][n] for w in WINDOWS}} for n in keys]
         return {"accounts": rows, "developers": devs, "since": self.since}
 
     def tick(self):

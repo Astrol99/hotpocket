@@ -271,6 +271,15 @@ async def test_open_status_pages_hear_when_usage_changes(gw):
     assert await asyncio.wait_for(events.content.readline(), 5) == b"data: changed\n"
 
 
+async def test_developers_share_the_pool_limits_by_what_their_requests_cost(gw):
+    await call(gw)  # alice, on the good account: 42% of its 5-hour limit, 10% of its weekly
+    alice = (await status(gw))["developers"][0]
+    assert alice["five_hour"] == pytest.approx(0.42 / 2) and alice["seven_day"] == pytest.approx(0.10 / 2)  # 2 accounts
+    await call(gw, dev(hotpocket.new_key("bob")))  # bob's request costs the same, so they split it evenly
+    devs = {d["name"]: d for d in (await status(gw))["developers"]}
+    assert devs["alice"]["five_hour"] == devs["bob"]["five_hour"] == pytest.approx(0.42 / 2 / 2)
+
+
 async def test_tokens_and_estimated_api_cost_are_counted(gw):
     await call(gw)  # streamed: Claude Opus 5.5, 100 in + 200 cache writes + 1000 cache reads + 50 out
     good = (await status(gw))["accounts"]["good"]
