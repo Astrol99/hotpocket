@@ -1,5 +1,5 @@
 """End-to-end tests for hotpocket against a fake Anthropic API. Run: uv run tests/test_gateway.py"""
-import http.client, json, os, subprocess, sys, tempfile, time
+import http.client, json, os, sqlite3, subprocess, sys, tempfile, time
 from pathlib import Path
 HERE = Path(__file__).resolve().parent
 GW = [sys.executable, "-m", "hotpocket"]  # the installed package (uv run installs it)
@@ -45,15 +45,22 @@ def call(headers, body=b'{"model":"x"}', conn=None, chunked=False):
     rest = r.read(); return r, first + rest, t_first, time.time() - t0, c
 
 
+def with_key(key, session):  # a developer's request headers
+    return dict(H, authorization=f"Bearer {key}", **{"x-claude-code-session-id": session})
+
+
 up = subprocess.Popen([sys.executable, str(HERE / "fake_upstream.py"), "18901", f"{G}/seen.log"])
 rc, out = cli("account", "import", stdin="# pool\nlimited=sk-ant-oat01-LIMITED\ngood=sk-ant-oat01-GOOD\n")
 ok(rc == 0, f"account import: {out}")
+ok(cli("account", "list")[1].split()[::2] == ["limited", "good"], "accounts listed in the order added")
 rc, bad = cli("account", "import", stdin="x=sk-ant-oat01-X\noops=nope\n")
 ok(rc != 0 and "nothing was imported" in bad, "bad import rejected")
 rc, key = cli("key", "add", "alice"); key = key.splitlines()[0]
 ok(key.startswith("hp-"), "key add")
-modes = oct(os.stat(f"{G}/data/accounts.json").st_mode & 0o777), oct(os.stat(f"{G}/data/keys.json").st_mode & 0o777)
-ok(modes == ("0o600", "0o600"), f"secret files are 0600 {modes}")
+modes = {f: oct(os.stat(f"{G}/data/{f}").st_mode & 0o777) for f in os.listdir(f"{G}/data") if f.startswith("hotpocket.db")}
+ok(set(modes.values()) == {"0o600"}, f"database files are owner-only {modes}")
+stored = b"".join(Path(f"{G}/data/{f}").read_bytes() for f in modes)
+ok(key.encode() not in stored, "developer keys are stored only as hashes")
 rc, out = cli("serve", "--port", "1")
 ok(rc != 0 and "takes no arguments" in out, "serve rejects flags instead of ignoring them")
 
@@ -92,7 +99,8 @@ ok(r.status == 200 and seen()[-1]["body_len"] == len(b'{"model":"chunked-body"}'
 snap, acc = status()
 ok(acc["limited"]["blocked_kind"] == "limit" and acc["limited"]["blocked_until"] > time.time() + 7000, "limited blocked until its reset header")
 ok(acc["good"]["five_hour"] == 0.42 and acc["good"]["requests"] == 3, f"usage tracked from headers ({acc['good']['five_hour']}, {acc['good']['requests']} req)")
-ok(snap["developers"][0]["name"] == "alice" and snap["developers"][0]["requests"] == 3, "per-developer counts")
+devs = {d["name"]: d for d in snap["developers"]}
+ok(devs["alice"]["requests"] == 3, "per-developer counts")
 r, page = get("/_gateway")
 ok(b"<title>hotpocket</title>" in page and "frame-ancestors 'none'" in r.getheader("content-security-policy", ""),
    "status page served, can't be framed")
@@ -102,10 +110,6 @@ ok(rc == 0 and "usage limit reached" in out, "CLI status")
 # --- managing from the status page (Tailscale serve supplies the identity headers)
 ADM = {"tailscale-user-login": "Admin@Example.com", "x-forwarded-proto": "https",
        "origin": "https://127.0.0.1:18900", "content-type": "application/json"}
-
-
-def with_key(key, session):  # a developer's request headers
-    return dict(H, authorization=f"Bearer {key}", **{"x-claude-code-session-id": session})
 
 
 def manage(method, path, body=None, headers={}):  # headers override ADM; None drops one
@@ -170,17 +174,6 @@ ok(hotpocket.used({"five_hour": .9, "five_hour_reset": time.time() - 1}, "five_h
 forged = "/_gateway/api/keys/x%0A2026-01-01%2000:00:00%20admin%20evil:%20removed%20the%20key%20for%20bob"
 ok(get(forged, "POST")[0].status == 403 and not any(l.startswith("2026-01-01") for l in open(f"{G}/gw.log")),
    "a request path can't forge lines in the audit log")
-admins = Path(f"{G}/data/admins.json"); good_admins = admins.read_text()
-admins.write_text(good_admins.rstrip().rstrip("}") + ",}")  # a broken hand edit
-ok(manage("POST", "keys/carol")[0] == 403, "a corrupt admins file grants no one access")
-admins.write_text('"admin@example.com"')  # valid JSON, wrong shape
-ok(manage("POST", "keys/carol", headers={"tailscale-user-login": "min@example.com"})[0] == 403,
-   "an admins file that isn't a JSON object grants no one access (no substring matches)")
-admins.write_text(good_admins)
-keys_file = Path(f"{G}/data/keys.json"); good_keys = keys_file.read_text()
-keys_file.write_text('["oops"]')  # wrong shape: the server keeps the last good keys instead of crashing
-ok(call(H)[0].status == 200 and cli("key", "add", "zed")[0] != 0, "a keys file that isn't a JSON object is refused, not crashed on")
-keys_file.write_text(good_keys)
 r, body = get("/_gateway/api/keys/carol", "POST", ADM)
 ok(r.status == 200 and r.getheader("cache-control") == "no-store", "a new key's response is never cached")
 manage("DELETE", "keys/carol")
@@ -247,25 +240,26 @@ c.request("POST", "http://evil.example/v1/messages", body=b"{}", headers=H)
 r = c.getresponse(); r.read()
 ok(r.status == 400 and len(seen()) == n0, f"absolute-form request target refused ({r.status}), nothing sent upstream")
 
-# a corrupt accounts file is never overwritten by the CLI, and the server keeps its last good copy
-good_accounts = open(f"{G}/data/accounts.json").read()
-open(f"{G}/data/accounts.json", "w").write(good_accounts.rstrip().rstrip("}") + ",}")  # trailing comma
-rc, out = cli("account", "add", "new", stdin="sk-ant-oat01-NEW\n")
-ok(rc != 0 and "not valid JSON" in out and open(f"{G}/data/accounts.json").read().endswith(",}"),
-   "CLI refuses to overwrite a corrupt accounts file")
-st, res = manage("PUT", "accounts/new", {"token": "sk-ant-oat01-NEW"})
-ok(st == 400 and "not valid JSON" in res["error"] and open(f"{G}/data/accounts.json").read().endswith(",}"),
-   "web page refuses to overwrite a corrupt accounts file")
-ok(get("/_gateway/health")[0].status == 200 and status()[1].get("slow") is not None,
-   "server keeps the last good accounts while the file is corrupt")
-open(f"{G}/data/accounts.json", "w").write(good_accounts)
+# a database held locked elsewhere (say an open sqlite3 shell): the page says busy instead of crashing
+locker = sqlite3.connect(f"{G}/data/hotpocket.db", isolation_level=None)
+locker.execute("BEGIN IMMEDIATE")
+st, res = manage("POST", "keys/busy")
+locker.execute("ROLLBACK"); locker.close()
+ok(st == 503 and "busy" in res["error"] and call(H)[0].status in (200, 429), f"locked database -> 503 on the page, proxy unaffected ({st})")
+
+# edits from the CLI and the page at the same moment both land
+procs = [subprocess.Popen([*GW, "key", "add", f"cli{i}"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+         for i in range(5)]
+web = [manage("POST", f"keys/web{i}")[0] for i in range(5)]
+ok(all(p.wait() == 0 for p in procs) and web == [200] * 5
+   and {f"cli{i}" for i in range(5)} | {f"web{i}" for i in range(5)} <= set(cli("key", "list")[1].split()),
+   "concurrent edits from the CLI and the page all land")
 
 cli("admin", "rm", "admin@example.com")
 ok(manage("DELETE", "keys/alice")[0] == 403, "removed admin can no longer manage")
 
 gw.terminate(); gw.wait(5)
-st = json.load(open(f"{G}/data/state.json"))
-ok(st["accounts"]["limited"]["blocked_until"] > time.time(), "state persisted on shutdown")
+ok(hotpocket.Pool().accounts["limited"]["blocked_until"] > time.time(), "usage state persisted on shutdown")
 up.terminate()
 print("\n--- gateway log"); print(open(f"{G}/gw.log").read().strip())
 print(f"\n{sum(results)}/{len(results)} passed")

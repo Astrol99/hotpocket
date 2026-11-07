@@ -31,20 +31,18 @@ or from `hotpocket key add`, and point Claude Code at the gateway (e.g. in
 """
 
 import asyncio
-import fcntl
 import getpass
 import hashlib
-import hmac
 import json
 import math
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import time
 import urllib.request
 from collections import Counter
-from contextlib import contextmanager
 from pathlib import Path
 
 import aiohttp
@@ -52,10 +50,7 @@ from aiohttp import web
 from yarl import URL
 
 DATA = Path(os.environ.get("HOTPOCKET_DATA", "/var/lib/hotpocket"))
-ACCOUNTS = DATA / "accounts.json"   # {label: token}, in priority order
-KEYS = DATA / "keys.json"           # {developer name: key}
-ADMINS = DATA / "admins.json"       # {Tailscale login: added at}; may manage from the web page
-STATE = DATA / "state.json"         # usage and blocks, survives restarts
+DB_FILE = DATA / "hotpocket.db"     # accounts, developer keys, admins and saved usage
 UPSTREAM = os.environ.get("HOTPOCKET_UPSTREAM", "https://api.anthropic.com").rstrip("/")
 HOST = os.environ.get("HOTPOCKET_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HOTPOCKET_PORT", "8080"))
@@ -119,65 +114,64 @@ def used(a, window, now):
     return 0 if reset is not None and reset <= now else a.get(window)
 
 
-def fingerprint(token):
-    return hashlib.sha256(token.encode()).hexdigest()[:16]
+def key_hash(key):
+    return hashlib.sha256(key.encode()).hexdigest()
 
 
-# --------------------------------------------------------------------------- files
-
-def read_json(path, default):
-    """A missing file is `default`; a corrupt one raises ValueError so it is never overwritten.
-
-    Every data file holds one JSON object; anything else (say a hand edit that left a bare
-    string, where `in` would match substrings) counts as corrupt.
-    """
-    try:
-        data = json.loads(path.read_text())
-    except FileNotFoundError:
-        return default
-    except json.JSONDecodeError as e:
-        raise ValueError(f"{path} is not valid JSON ({e}); fix or remove it") from None
-    if not isinstance(data, dict):
-        raise ValueError(f"{path} must hold a JSON object, not {type(data).__name__}; fix or remove it")
-    return data
+def fingerprint(token):  # short, for remembering which token earned a block
+    return key_hash(token)[:16]
 
 
-def write_json(path, data):
-    """Atomic 0600 write. When root edits the files, keep them owned by the service user."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(json.dumps(data, indent=2) + "\n")
-    st = path.parent.stat()
-    if os.geteuid() == 0 and st.st_uid != 0:
-        os.chown(tmp, st.st_uid, st.st_gid)
-    os.replace(tmp, path)
+# --------------------------------------------------------------------------- storage
+# One SQLite database, shared by the server and the admin CLI. Every change is a single
+# statement (or one transaction), so edits from both sides land whole and in order.
+
+SCHEMA = """
+-- Accounts are tried in `position` order when their usage is tied.
+CREATE TABLE IF NOT EXISTS accounts (label TEXT PRIMARY KEY, token TEXT NOT NULL, position INTEGER NOT NULL);
+-- Only a hash of each developer key is kept; the key itself is shown once and never stored.
+CREATE TABLE IF NOT EXISTS keys (name TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS admins (login TEXT PRIMARY KEY, added REAL NOT NULL);  -- Tailscale logins
+CREATE TABLE IF NOT EXISTS state (name TEXT PRIMARY KEY, value TEXT NOT NULL);    -- the pool's saved usage (JSON)
+"""
+_db = None
 
 
-class Watched:
-    """A JSON file that is re-read whenever it changes, so admin edits apply live."""
+def db():
+    """This process's connection (creating the database on first use)."""
+    global _db
+    if _db is None:
+        DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.geteuid() == 0 and DATA.stat().st_uid != 0:
+            # Files root made here (the database, its -wal and -shm) would lock the service out.
+            raise AdminError(f"Run this as the user that owns {DATA}, not root (/usr/local/bin/hotpocket does that).")
+        _db = sqlite3.connect(DB_FILE, timeout=10)  # waits, rather than fails, while another process writes
+        _db.execute("PRAGMA journal_mode = WAL")    # the server reads while the CLI writes
+        _db.executescript(SCHEMA)
+    return _db
 
-    def __init__(self, path, keep_last_good=True):
-        self.path, self.mtime, self.data, self.keep_last_good = path, None, {}, keep_last_good
 
-    def get(self):
-        try:
-            st = self.path.stat()
-            mtime = (st.st_mtime_ns, st.st_ino, st.st_size)  # write_json always makes a new inode
-        except FileNotFoundError:
-            mtime = None
-        if mtime != self.mtime:
-            self.mtime = mtime
-            try:
-                self.data = read_json(self.path, {})
-            except ValueError as e:
-                if self.keep_last_good:
-                    log(f"{e}; still using the last good copy")
-                else:
-                    self.data = {}
-                    log(f"{e}; treating it as empty")
-        return self.data
+def write(sql, *params):
+    """Run one change; returns how many rows it touched."""
+    with db() as con:
+        return con.execute(sql, params).rowcount
+
+
+def load_accounts():
+    """{label: token}, in the order the accounts were added."""
+    return dict(db().execute("SELECT label, token FROM accounts ORDER BY position"))
+
+
+def key_names():
+    return [name for (name,) in db().execute("SELECT name FROM keys ORDER BY created")]
+
+
+def admin_logins():
+    return [login for (login,) in db().execute("SELECT login FROM admins ORDER BY added")]
+
+
+def is_admin(login):
+    return db().execute("SELECT 1 FROM admins WHERE login = ?", (login,)).fetchone() is not None
 
 
 # --------------------------------------------------------------------------- pool
@@ -185,10 +179,11 @@ class Watched:
 
 class Pool:
     def __init__(self):
+        row = db().execute("SELECT value FROM state WHERE name = 'pool'").fetchone()
         try:
-            saved = read_json(STATE, {})
+            saved = json.loads(row[0]) if row else {}
         except ValueError as e:
-            log(f"{e}; starting with empty usage state")
+            log(f"saved usage is unreadable ({e}); starting with empty usage state")
             saved = {}
         self.accounts = saved.get("accounts", {})  # label -> usage, block and request count
         self.devs = saved.get("devs", {})
@@ -266,13 +261,11 @@ class Pool:
         cutoff = time.time() - SESSION_TTL
         self.sessions = {s: v for s, v in self.sessions.items() if v[1] > cutoff}
         if self.dirty:
-            write_json(STATE, {"accounts": self.accounts, "devs": self.devs})
+            write("INSERT OR REPLACE INTO state VALUES ('pool', ?)",
+                  json.dumps({"accounts": self.accounts, "devs": self.devs}))
             self.dirty = False
 
 
-ACCOUNT_FILE = Watched(ACCOUNTS)
-KEY_FILE = Watched(KEYS)
-ADMIN_FILE = Watched(ADMINS, keep_last_good=False)  # a broken edit must not keep a removed admin
 POOL: Pool = None
 CLIENT: aiohttp.ClientSession = None
 
@@ -296,12 +289,10 @@ def api_error(status, etype, message, headers=None):
 def developer(headers):
     auth = headers.get("authorization", "")
     presented = (auth[7:] if auth.lower().startswith("bearer ") else headers.get("x-api-key", "")).strip()
-    if presented:
-        presented = presented.encode()
-        for name, key in KEY_FILE.get().items():
-            if hmac.compare_digest(presented, str(key).encode()):
-                return name
-    return None
+    if not presented:
+        return None
+    row = db().execute("SELECT name FROM keys WHERE hash = ?", (key_hash(presented),)).fetchone()
+    return row and row[0]
 
 
 def upstream_headers(headers):
@@ -327,7 +318,7 @@ async def proxy(request):
         # An absolute-form target ("http://host/...") would be glued onto UPSTREAM's host.
         return api_error(400, "invalid_request_error", "hotpocket: request target must be a path.")
     tag = f"{dev} {request.method} {request.path}"
-    accounts = ACCOUNT_FILE.get()
+    accounts = load_accounts()
     if not accounts:
         return api_error(503, "api_error", "hotpocket: no accounts configured.")
     body = await request.read()  # buffered so the request can be resent on another account
@@ -445,16 +436,16 @@ def viewer(remote, headers):
     login = (headers.get("tailscale-user-login") or "").lower() or None
     https = headers.get("x-forwarded-proto") == "https"
     member = bool(login and https)
-    return {"login": login, "https": https, "member": member, "admin": member and login in ADMIN_FILE.get()}
+    return {"login": login, "https": https, "member": member, "admin": member and is_admin(login)}
 
 
 async def health(_request):
-    snap = POOL.snapshot(ACCOUNT_FILE.get(), KEY_FILE.get())
+    snap = POOL.snapshot(load_accounts(), key_names())
     return web.json_response({"ok": True, "accounts": len(snap["accounts"]), "available": snap["available"]})
 
 
 async def status_json(request):
-    snap = POOL.snapshot(ACCOUNT_FILE.get(), KEY_FILE.get())
+    snap = POOL.snapshot(load_accounts(), key_names())
     snap["viewer"] = viewer(request.remote, request.headers)
     return web.json_response(snap, dumps=lambda d: json.dumps(d, indent=2))
 
@@ -496,6 +487,9 @@ def page_api(role):
                 done, result = await handler(request, **request.match_info)
             except AdminError as e:
                 return web.json_response({"error": str(e)}, status=400)
+            except sqlite3.OperationalError as e:  # e.g. locked by a long write elsewhere
+                log(f"refused {request.method} {request.rel_url.raw_path}: database error ({e})")
+                return web.json_response({"error": "The database is busy; try again in a moment."}, status=503)
             log(f"{'admin ' if role == 'admin' else ''}{who['login']}: {done}")
             return web.json_response(result, headers={"cache-control": "no-store"})  # may hold a new key
         return wrapped
@@ -514,7 +508,7 @@ async def put_account(request, name):
 
 @page_api("admin")
 async def delete_account(_request, name):
-    remove(ACCOUNTS, name, "account")
+    remove("accounts", "label", name, "account")
     return f"removed account {name}", {}
 
 
@@ -546,14 +540,18 @@ def serve(argv):
         die("`serve` takes no arguments; set HOTPOCKET_HOST and HOTPOCKET_PORT instead.")
     UI_PAGE = UI_FILE.read_bytes()
     POOL = Pool()
+    # The server never waits long for the database: a stuck writer elsewhere (say an open
+    # sqlite3 shell) would otherwise stall every stream on the event loop. A failed usage
+    # save just retries on the next tick.
+    db().execute("PRAGMA busy_timeout = 1000")
 
     async def ticker():
         while True:
             await asyncio.sleep(5)
             try:
                 POOL.tick()
-            except OSError as e:
-                log(f"could not save state: {e}")
+            except sqlite3.Error as e:
+                log(f"could not save usage: {e}")
 
     async def lifespan(_app):
         global CLIENT
@@ -564,7 +562,7 @@ def serve(argv):
             connector=aiohttp.TCPConnector(limit=0))
         task = asyncio.create_task(ticker())
         log(f"listening on http://{HOST}:{PORT} -> {UPSTREAM} "
-            f"({len(ACCOUNT_FILE.get())} accounts, {len(KEY_FILE.get())} developer keys)")
+            f"({len(load_accounts())} accounts, {len(key_names())} developer keys)")
         yield
         task.cancel()
         await CLIENT.close()
@@ -608,35 +606,17 @@ def read_token():
     return sys.stdin.read()
 
 
-def read_admin_json(path):
-    """For edits: refuse to touch a corrupt file instead of replacing its contents."""
-    try:
-        return read_json(path, {})
-    except ValueError as e:
-        raise AdminError(str(e)) from None
-
-
-@contextmanager
-def editing(path):
-    """Read-modify-write an admin file; nothing is written if the body raises.
-
-    The data directory is locked meanwhile, so an edit from the CLI and one from the
-    status page can't both read the old file and one silently undo the other.
-    """
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        data = read_admin_json(path)
-        yield data
-        write_json(path, data)
-    finally:
-        os.close(fd)
-
-
 def check_name(name, what):
     if not NAME_RE.fullmatch(name):
         raise AdminError(f"{what} names are letters, digits and . _ - @ + % (not only dots, at most 254).")
+
+
+def save_accounts(entries):
+    """Add or replace (label, token) pairs, all or none; a replaced account keeps its place."""
+    with db() as con:
+        con.executemany("INSERT INTO accounts VALUES (?, ?, (SELECT IFNULL(MAX(position), 0) + 1 FROM accounts)) "
+                        "ON CONFLICT (label) DO UPDATE SET token = excluded.token", entries)
+        return con.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
 
 
 def save_account(label, raw_token):
@@ -644,27 +624,24 @@ def save_account(label, raw_token):
     token = clean_token(raw_token)
     if not token:
         raise AdminError("That doesn't look like a Claude Code token (expected sk-ant-oat...).")
-    with editing(ACCOUNTS) as accounts:
-        accounts[label] = token
-    return len(accounts)
+    return save_accounts([(label, token)])
 
 
 def new_key(name):
     name = name.lower()  # developer names are usually Tailscale logins, which ignore case
     check_name(name, "Developer")
-    with editing(KEYS) as keys:
-        keys[name] = key = "hp-" + secrets.token_urlsafe(24)
+    key = "hp-" + secrets.token_urlsafe(24)
+    write("INSERT OR REPLACE INTO keys VALUES (?, ?, ?)", name, key_hash(key), time.time())
     return key
 
 
+def remove(table, column, value, what):
+    if not write(f"DELETE FROM {table} WHERE {column} = ?", value):
+        raise AdminError(f"No {what} named '{value}'.")
+
+
 def revoke_key(name):
-    remove(KEYS, name.lower(), "developer key")
-
-
-def remove(path, name, what):
-    with editing(path) as entries:
-        if entries.pop(name, None) is None:
-            raise AdminError(f"No {what} named '{name}'.")
+    remove("keys", "name", name.lower(), "developer key")
 
 
 def cmd_account(argv):
@@ -686,14 +663,13 @@ def cmd_account(argv):
             entries.append((label, token))
         if not entries:
             raise AdminError("No accounts found on stdin.")
-        with editing(ACCOUNTS) as accounts:
-            accounts.update(entries)
-        print(f"Imported {', '.join(l for l, _ in entries)} ({len(accounts)} total).")
+        total = save_accounts(entries)
+        print(f"Imported {', '.join(l for l, _ in entries)} ({total} total).")
     elif sub == "rm" and len(args) == 1:
-        remove(ACCOUNTS, args[0], "account")
+        remove("accounts", "label", args[0], "account")
         print(f"Removed account '{args[0]}'.")
     elif sub == "list":
-        accounts = read_admin_json(ACCOUNTS)
+        accounts = load_accounts()
         for label, token in accounts.items():
             print(f"{label:20} {token[:14]}…{token[-4:]}")
         if not accounts:
@@ -713,7 +689,7 @@ def cmd_key(argv):
         print(f"Removed the key for '{name}'. Anyone on the tailnet can still make their own key, "
               "so to keep someone out, remove them from the tailnet.")
     elif sub == "list":
-        print("\n".join(read_admin_json(KEYS)) or "No developer keys. Create one with: hotpocket key add NAME")
+        print("\n".join(key_names()) or "No developer keys. Create one with: hotpocket key add NAME")
     else:
         die("Usage: hotpocket key add NAME | rm NAME | list")
 
@@ -724,14 +700,13 @@ def cmd_admin(argv):
     if sub == "add" and login:
         if not NAME_RE.fullmatch(login):
             raise AdminError("Use the Tailscale login exactly as the status page shows it, e.g. you@example.com.")
-        with editing(ADMINS) as admins:
-            admins[login] = int(time.time())
+        write("INSERT OR IGNORE INTO admins VALUES (?, ?)", login, time.time())
         print(f"{login} can now manage accounts and keys at https://<gateway>/_gateway.")
     elif sub == "rm" and login:
-        remove(ADMINS, login, "admin")
+        remove("admins", "login", login, "admin")
         print(f"{login} can no longer manage hotpocket from the web.")
     elif sub == "list":
-        print("\n".join(read_admin_json(ADMINS)) or "No admins. Add one with: hotpocket admin add LOGIN")
+        print("\n".join(admin_logins()) or "No admins. Add one with: hotpocket admin add LOGIN")
     else:
         die("Usage: hotpocket admin add LOGIN | rm LOGIN | list")
 
@@ -758,6 +733,7 @@ def cmd_status(_argv):
 
 
 def main():
+    os.umask(0o077)  # the database holds account tokens: owner-only files
     argv = sys.argv[1:]
     commands = {"serve": serve, "account": cmd_account, "key": cmd_key, "admin": cmd_admin,
                 "status": cmd_status}
@@ -768,3 +744,5 @@ def main():
         return commands[argv[0]](argv[1:]) or 0
     except AdminError as e:
         die(str(e))
+    except sqlite3.OperationalError as e:
+        die(f"Can't use {DB_FILE} ({e}).")

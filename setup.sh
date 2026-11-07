@@ -25,7 +25,10 @@ id hotpocket >/dev/null 2>&1 ||
 echo "==> Installing the gateway"
 # The exact locked dependency versions, on the container's own Python.
 UV_LINK_MODE=copy uv sync -q --frozen --no-dev --no-editable --python /usr/bin/python3
-ln -sf /opt/hotpocket/.venv/bin/hotpocket /usr/local/bin/hotpocket
+# `hotpocket` for admins: run as root (incus exec), it switches to the service user, so the
+# database files it writes stay the service's.
+rm -f /usr/local/bin/hotpocket
+install -m 0755 hotpocket-cli.sh /usr/local/bin/hotpocket
 install -m 0644 hotpocket.service /etc/systemd/system/
 install -D -m 0644 hardening.conf /etc/systemd/system/hotpocket.service.d/zzzz-hardening.conf
 systemctl daemon-reload

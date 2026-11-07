@@ -32,9 +32,14 @@ until in_ct getent hosts pkgs.tailscale.com >/dev/null 2>&1; do
   sleep 2
 done
 
+# The file list comes from git: fail here, before the container's copy is removed.
+git -C "$DIR" rev-parse --git-dir >/dev/null || { echo "deploy.sh must run from a git checkout" >&2; exit 1; }
 in_ct rm -rf /opt/hotpocket/src
 in_ct mkdir -p /opt/hotpocket
-tar -C "$DIR" --exclude=__pycache__ -cf - pyproject.toml uv.lock src setup.sh hotpocket.service hardening.conf |
+# Everything in the repo (tracked, plus new files git doesn't ignore), so the build always
+# has whatever pyproject.toml refers to. .gitignore must cover anything secret or local.
+git -C "$DIR" ls-files -z --cached --others --exclude-standard |
+  tar -C "$DIR" --null --ignore-failed-read -T - -cf - |
   in_ct tar -C /opt/hotpocket --no-same-owner -xf -
 in_ct sh /opt/hotpocket/setup.sh
 

@@ -156,10 +156,11 @@ tokens. Settings are environment variables: `HOTPOCKET_DATA` (default
   it with `account add`; the new token is used right away.
 - In the Tailscale admin console, turn off key expiry for the `hotpocket`
   machine so it doesn't drop off the tailnet after 180 days.
-- Files in the container: `/opt/hotpocket/` (code and its `.venv`, with
-  `hotpocket` linked into `/usr/local/bin`) and `/var/lib/hotpocket/`
-  (`accounts.json`, `keys.json`, `state.json`, all `0600`). The service runs as
-  the unprivileged `hotpocket` user.
+- Files in the container: `/opt/hotpocket/` (code and its `.venv`) and
+  `/var/lib/hotpocket/hotpocket.db`, a SQLite database (`0600`) with the accounts,
+  developer keys (stored only as hashes), admins and saved usage. The service runs
+  as the unprivileged `hotpocket` user, and the `hotpocket` admin command switches
+  to that user when run as root.
 - `deploy.sh` creates the container if needed, copies the code in, and runs
   `setup.sh` inside it. Every step skips work that is already done, so a failed
   run can just be run again.
