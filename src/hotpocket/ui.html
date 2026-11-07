@@ -35,7 +35,11 @@ tbody th{font-weight:600}
 .pct{min-width:3em;text-align:right}
 .ok{color:var(--ok)}.bad{color:var(--bad)}
 .actions{text-align:right}
-.actions button+button{margin-left:6px}
+.more{padding:1px 9px;font-size:16px;line-height:1.3}
+.menu{padding:4px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);box-shadow:0 8px 24px rgb(0 0 0/.18);text-align:left}
+.menu button{display:block;width:100%;text-align:left;border:0;background:none;padding:7px 12px}
+.menu button:hover{background:var(--panel)}
+@supports (position-area:bottom){.menu{inset:auto;margin:4px 0;position-area:bottom span-left;position-try-fallbacks:flip-block}}
 button{font:inherit;font-size:13px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);padding:5px 11px;cursor:pointer}
 button.primary{background:var(--btn);border-color:var(--btn);color:var(--btn-fg);font-size:14px;padding:7px 14px}
 button:disabled{opacity:.5;cursor:default}
@@ -54,11 +58,13 @@ body:not(.is-admin) .admin-only{display:none!important}
   .wrap{overflow:visible}
   table,tbody,tr,th,td{display:block}
   thead{display:none}
-  tbody tr{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;padding:14px 0;border-bottom:1px solid var(--line)}
+  tbody tr{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;padding:14px 0;border-bottom:1px solid var(--line);position:relative}
   tbody th,tbody td{border:0;padding:0;white-space:normal}
-  tbody th,td[data-label=State],td[colspan],.actions{grid-column:1/-1}
+  tbody th{padding-right:44px;overflow-wrap:anywhere}
+  tbody th,td[data-label=State],td[colspan]{grid-column:1/-1}
+  .actions{position:absolute;top:12px;right:0}
   td[data-label]::before{content:attr(data-label);display:block;color:var(--mute);font-size:12px;margin-bottom:2px}
-  .num,.actions{text-align:left}
+  .num{text-align:left}
   .actions:empty{display:none}
   .meter{min-width:0}
 }
@@ -239,13 +245,23 @@ function usageAge(a) {
            a.usage_at ? 'usage as of ' + ago(a.usage_at) : 'usage from earlier');
 }
 
+// A row's actions sit behind a "⋯" button, in a native popover: it closes on Esc or a click elsewhere.
+let menus = 0;
+function menu(name, ...items) {
+  if (!(items = items.filter(Boolean)).length) return null;
+  const id = 'menu-' + ++menus, pop = h('div', {id, class: 'menu', popover: '', style: `position-anchor:--${id}`}, items);
+  pop.addEventListener('click', () => pop.hidePopover(), true);  // closes before the item acts (or asks)
+  return [h('button', {class: 'more', popovertarget: id, style: `anchor-name:--${id}`, title: 'Actions',
+                       'aria-label': 'Actions for ' + name}, '⋯'), pop];
+}
+
 function accountRow(a) {
   return h('tr', {},
     h('th', {scope: 'row'}, a.label, usageAge(a)), stateCell(a), meterCell(a, 'five_hour', '5-hour'), meterCell(a, 'seven_day', 'Weekly'),
     usageCell(a),
-    h('td', {class: 'actions admin-only'},
+    h('td', {class: 'actions admin-only'}, menu(a.label,
       h('button', {onclick: () => replaceToken(a.label)}, 'New token'),
-      h('button', {class: 'bad', onclick: e => removeAccount(e.target, a.label)}, 'Remove')));
+      h('button', {class: 'bad', onclick: e => removeAccount(e.target, a.label)}, 'Remove'))));
 }
 
 function devRow(d) {
@@ -255,10 +271,10 @@ function devRow(d) {
     h('td', {title: clock(d.last_seen), 'data-label': 'Last seen'}, ago(d.last_seen)),
     h('td', {'data-label': 'Last account'}, d.last_account || '–'),
     // Your own row has "New key" (to set up again or replace a lost key); admins can do it for anyone.
-    h('td', {class: 'actions'},
+    h('td', {class: 'actions'}, menu(d.name,
       d.name === snap.viewer.login ? h('button', {onclick: e => newMyKey(e.target)}, 'New key')
         : snap.viewer.admin ? h('button', {onclick: e => makeKey(e.target, d.name, true)}, 'New key') : null,
-      snap.viewer.admin ? h('button', {class: 'bad', onclick: e => removeDev(e.target, d.name)}, 'Remove') : null));
+      snap.viewer.admin ? h('button', {class: 'bad', onclick: e => removeDev(e.target, d.name)}, 'Remove') : null)));
 }
 
 function accessNote(v) {
@@ -403,8 +419,9 @@ $('#key-form').addEventListener('submit', async e => {
 });
 
 refresh();
-setInterval(() => { if (!document.hidden) refresh(); }, 15000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+const autoRefresh = () => { if (!document.hidden && !$(':popover-open')) refresh(); };  // not under an open menu
+setInterval(autoRefresh, 15000);
+document.addEventListener('visibilitychange', autoRefresh);
 </script>
 </body>
 </html>
