@@ -7,22 +7,14 @@ services:
       TS_AUTHKEY: ${TS_AUTHKEY:-}          # optional: without one, `docker compose logs tailscale` shows a login link
       TS_STATE_DIR: /var/lib/tailscale
       TS_SERVE_CONFIG: /serve.json
-      # Kernel networking, not the default userspace mode: in userspace mode tailscaled hands
-      # tailnet connections for 100.x:8080 to 127.0.0.1:8080, where hotpocket trusts identity
-      # headers, so anyone on the tailnet could claim an admin's login.
-      TS_USERSPACE: "false"
-    devices: [/dev/net/tun]
-    cap_add: [net_admin]
     configs: [{source: serve, target: /serve.json}]
-    volumes: [tailscale:/var/lib/tailscale]
+    volumes: [tailscale:/var/lib/tailscale, socket:/run/hotpocket]
     logging: {driver: local}               # rotates, like hotpocket's (Docker's default json-file never does)
     restart: unless-stopped
   hotpocket:
     build: .
-    network_mode: service:tailscale        # reachable only through Tailscale serve, at 127.0.0.1:8080
-    depends_on:  # it lives in tailscale's network namespace, which a tailscale restart replaces
-      tailscale: {condition: service_started, restart: true}
-    volumes: [data:/data]
+    # No ports: its only way in is the socket it shares with Tailscale serve, which says who is asking.
+    volumes: [data:/data, socket:/run/hotpocket]
     logging: {driver: local}               # rotates (a line per request adds up)
     read_only: true
     tmpfs: [/tmp]
@@ -31,12 +23,14 @@ services:
     restart: unless-stopped
 
 configs:
-  # HTTPS for everything; plain HTTP (http://hotpocket) only redirects to it. Compose doesn't notice an
-  # edit here: apply one with `docker compose up -d --force-recreate` (both services, as they share a network).
+  # HTTPS for everything; plain HTTP (http://hotpocket) only redirects to it. Serve also passes on the
+  # admin grant from the tailnet policy (see the README). Compose doesn't notice an edit here: apply one
+  # with `docker compose up -d --force-recreate tailscale`.
   serve:
     content: |
       {"TCP": {"443": {"HTTPS": true}, "80": {"HTTP": true}},
-       "Web": {"$${TS_CERT_DOMAIN}:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8080"}}},
+       "Web": {"$${TS_CERT_DOMAIN}:443": {"Handlers": {"/": {"Proxy": "unix:/run/hotpocket/hotpocket.sock",
+                                                              "AcceptAppCaps": ["github.com/astrol99/hotpocket/admin"]}}},
                "$${TS_CERT_DOMAIN}:80": {"Handlers": {"/": {"Redirect": "https://$${TS_CERT_DOMAIN}/"}}}}}
 
-volumes: {tailscale: {}, data: {}}
+volumes: {tailscale: {}, data: {}, socket: {}}

@@ -42,15 +42,22 @@ in `.env`:
 git clone https://github.com/Astrol99/hotpocket && cd hotpocket
 echo TS_AUTHKEY=tskey-auth-... > .env
 docker compose up -d --build        # also how you update: git pull, then this again
-docker compose exec hotpocket hotpocket admin add you@example.com   # your Tailscale login
 ```
 
 Without a key, open the newest link from `docker compose logs -f tailscale`; the
 link changes every minute until it's used.
 
 In the Tailscale admin console, tag the `hotpocket` machine (say `tag:hotpocket`, or
-use an auth key with that tag) so it never expires. If your tailnet has its own
-access rules, also let the team reach it on ports 80 and 443, for example
+use an auth key with that tag) so it never expires. Then, under Access controls,
+make yourself an admin by adding this to the policy's `"grants"` list, next to what's
+already there (Tailscale serve tells hotpocket who has it):
+
+```json
+{"src": ["you@example.com"], "dst": ["tag:hotpocket"], "app": {"github.com/astrol99/hotpocket/admin": [{}]}}
+```
+
+If your tailnet has its own access rules, also let the team reach it on ports 80
+and 443, for example
 `{"action": "accept", "src": ["group:devs"], "dst": ["tag:hotpocket:80,443"]}`.
 
 Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts.net`:
@@ -70,20 +77,23 @@ Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts
   need the history.
 
 `http://hotpocket` is a shortcut that redirects there. hotpocket learns who you
-are from Tailscale serve, which reaches it on 127.0.0.1 in the Tailscale
-container's network, so never publish its port or put another proxy in front of it.
+are, and whether you're an admin, from Tailscale serve, which reaches it on a unix
+socket the two containers share. That is its only way in: don't add another.
 
 ## Development
 
 ```sh
-uv run pytest                                  # tests, against a fake Anthropic API
-HOTPOCKET_DATA=./data uv run hotpocket serve   # run it locally
+uv run pytest                     # tests, against a fake Anthropic API
+HOTPOCKET_DATA=./data HOTPOCKET_SOCKET=./data/hotpocket.sock uv run hotpocket   # run it locally
+curl --unix-socket ./data/hotpocket.sock http://hotpocket/_gateway/status
 ```
 
-Settings are environment variables: `HOTPOCKET_DATA` (where `hotpocket.db` lives),
-`HOTPOCKET_HOST` (default `127.0.0.1`) and `HOTPOCKET_PORT` (default `8080`).
-The database holds the accounts, developer keys (stored only as hashes), admins
-and saved usage.
+Settings are environment variables: `HOTPOCKET_DATA` (where `hotpocket.db` lives) and
+`HOTPOCKET_SOCKET` (default `/run/hotpocket/hotpocket.sock`). To use a local copy
+from Claude Code, put it behind
+`tailscale serve --accept-app-caps github.com/astrol99/hotpocket/admin unix:$PWD/data/hotpocket.sock`
+(an absolute path: tailscaled doesn't run in your directory). The database holds
+the accounts, developer keys (stored only as hashes) and saved usage.
 
 ## License
 

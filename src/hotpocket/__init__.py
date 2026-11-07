@@ -1,10 +1,5 @@
-"""hotpocket: one Claude Code endpoint for the team, backed by a pool of Claude accounts.
+"""hotpocket: one Claude Code endpoint for the team, backed by a pool of Claude accounts."""
 
-Make yourself an admin (`hotpocket admin add LOGIN`, your Tailscale login); everything else,
-developers' keys included, is on the status page at https://<gateway>.
-"""
-
-import argparse
 import asyncio
 import datetime
 import functools
@@ -14,6 +9,7 @@ import math
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import time
 from collections import Counter
@@ -27,8 +23,9 @@ from yarl import URL
 
 DATA = Path(os.environ.get("HOTPOCKET_DATA", "/var/lib/hotpocket"))  # holds hotpocket.db
 UPSTREAM = os.environ.get("HOTPOCKET_UPSTREAM", "https://api.anthropic.com").rstrip("/")
-HOST = os.environ.get("HOTPOCKET_HOST", "127.0.0.1")
-PORT = int(os.environ.get("HOTPOCKET_PORT", "8080"))
+# Tailscale serve's way in, and the only one: whoever reaches it is believed about who they are.
+SOCKET = os.environ.get("HOTPOCKET_SOCKET", "/run/hotpocket/hotpocket.sock")
+ADMIN_CAP = "github.com/astrol99/hotpocket/admin"  # an app capability the tailnet policy grants admins
 
 OAUTH_BETA = "oauth-2025-04-20"
 UNIFIED = "anthropic-ratelimit-unified-"
@@ -41,7 +38,7 @@ MAX_BODY = 32 * 1024 * 1024  # the Messages API's own request size limit
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 REASONS = {"auth": "token rejected", "limit": "usage limit reached"}
 
-# Account labels, developer names and admin logins. Developer names are often Tailscale logins
+# Account labels and developer names. Developer names are often Tailscale logins
 # (you@example.com, you@github); all-dot names are refused because "." and ".." break URLs.
 NAME_RE = re.compile(r"(?!\.+$)[\w.%+@-]{1,254}", re.ASCII)
 TOKEN_RE = re.compile(r"sk-ant-oat[0-9]*-[A-Za-z0-9_-]+")
@@ -106,25 +103,24 @@ def key_hash(key):
 
 
 # --------------------------------------------------------------------------- storage
-# One SQLite database, shared by the server and the admin CLI. Every change is a single
-# statement (or one transaction), so edits from both sides land whole and in order.
 
 SCHEMA = """
 -- Accounts are tried in `position` order when their usage is tied.
 CREATE TABLE IF NOT EXISTS accounts (label TEXT PRIMARY KEY, token TEXT NOT NULL, position INTEGER NOT NULL);
 -- Only a hash of each developer key is kept; the key itself is shown once and never stored.
 CREATE TABLE IF NOT EXISTS keys (name TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, created REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS admins (login TEXT PRIMARY KEY, added REAL NOT NULL);  -- Tailscale logins
 CREATE TABLE IF NOT EXISTS state (name TEXT PRIMARY KEY, value TEXT NOT NULL);    -- the pool's saved usage (JSON)
 """
 
 
 @functools.cache
 def db():
-    """This process's connection (creating the database on first use)."""
+    """The database connection (creating the database on first use)."""
     DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
-    con = sqlite3.connect(DATA / "hotpocket.db", timeout=10)  # waits, rather than fails, while another process writes
-    con.execute("PRAGMA journal_mode = WAL")                  # the server reads while the CLI writes
+    # Never waits long: a stuck writer (say an open sqlite3 shell) would stall every stream. A failed
+    # usage save retries at the next tick.
+    con = sqlite3.connect(DATA / "hotpocket.db", timeout=1)
+    con.execute("PRAGMA journal_mode = WAL")  # someone reading it in a sqlite3 shell doesn't hold up writes
     con.executescript(SCHEMA)
     return con
 
@@ -181,10 +177,16 @@ class Pool:
 
     def choose(self, accounts, session, exclude):
         now = time.time()
-        ready = [l for l, token in accounts.items()
-                 if l not in exclude and not self.blocked(l, token, now)]
+        left = [l for l in accounts if l not in exclude]
+        ready = [l for l in left if not self.blocked(l, accounts[l], now)]
         if not ready:
-            return None
+            # A rejected token gets another try when nothing else is left (the request would fail anyway),
+            # so if Anthropic rejected every token at once, the pool is back as soon as it recovers. Only one
+            # per request, the longest-rejected first: revoked tokens cost a request one call, not one each.
+            rejected = [l for l in left if self.accounts[l].get("blocked_kind") == "auth"]
+            if not rejected or any(self.accounts.get(l, {}).get("blocked_kind") == "auth" for l in exclude):
+                return None
+            return min(rejected, key=lambda l: self.accounts[l]["blocked_until"])
         sticky = self.sessions.get(session, (None,))[0]
         return (sticky if sticky in ready and self._util(sticky) < STICKY_MAX_UTIL
                 else min(ready, key=self._util))  # ties go to the earlier-added account
@@ -209,8 +211,9 @@ class Pool:
 
     def served(self, label, dev, model, usage):
         d, a, cost, now = self.devs.setdefault(dev, {"requests": 0}), self._acct(label), api_cost(model, usage), time.time()
-        if a.get("blocked_until", 0) <= now:
-            a.pop("blocked_kind", None)  # it works again; a block still running (another request's, meanwhile) stays
+        # It works again, so a rejection is over; a usage limit another request hit meanwhile stays.
+        if a.get("blocked_until", 0) <= now or a.get("blocked_kind") == "auth":
+            a["blocked_kind"], a["blocked_until"] = None, 0
         windows = a.setdefault("spent", {})
         for w in WINDOWS:  # what each developer spent in the account's current windows, to split its use by
             spent = windows.get(w)
@@ -312,8 +315,8 @@ async def proxy(request):
     if dev is None:
         # Log refused API calls, not browsers asking for /favicon.ico and the like.
         if request.path.startswith("/v1/") or "authorization" in request.headers or "x-api-key" in request.headers:
-            who = viewer(request.remote, request.headers)["login"] or request.remote
-            log(f"refused {request.method} {request.rel_url.raw_path} from {who}: missing or unknown developer key")
+            log(f"refused {request.method} {request.rel_url.raw_path} from {source(request)}: "
+                "missing or unknown developer key")
         # The gateway never sends 401: Claude Code retries a 401 for minutes before giving up.
         return api_error(403, "permission_error", "hotpocket: missing or unknown developer key. "
                          "Get a new one on the hotpocket status page and paste its setup prompt into Claude Code.")
@@ -446,15 +449,18 @@ PAGE_HEADERS = {
 }
 
 
-def viewer(remote, headers):
+def viewer(headers):
     """Who is asking and what they may do: a "member" (signed in to Tailscale) may get their own key;
-    an "admin" may manage the gateway. Tailscale serve sets the login on every request it forwards
-    (none for tagged devices), and runs on this host, so it's only believed from here."""
-    if remote not in ("127.0.0.1", "::1"):
-        return {"login": None, "member": False, "admin": False}
+    an "admin" may manage the gateway. Tailscale serve replaces these headers on every request: the login
+    (none for tagged devices), and the capabilities it is told to pass on, with what each grant says."""
     login = (headers.get("tailscale-user-login") or "").lower() or None
-    admin = bool(login) and db().execute("SELECT 1 FROM admins WHERE login = ?", (login,)).fetchone() is not None
+    admin = ADMIN_CAP in json.loads(headers.get("tailscale-app-capabilities") or "{}")
     return {"login": login, "member": bool(login), "admin": admin}
+
+
+def source(request):
+    """Who to name in a log line: the login, or for a tagged device its tailnet address."""
+    return viewer(request.headers)["login"] or request.headers.get("x-forwarded-for")
 
 
 @routes.get("/_gateway/events", allow_head=False)  # a HEAD reply ends at the headers, while this would write on
@@ -481,7 +487,7 @@ async def events(request):
 @routes.get("/_gateway/status")
 async def status_json(request):
     snap = POOL.snapshot(load_accounts(), key_names())
-    snap["viewer"] = viewer(request.remote, request.headers)
+    snap["viewer"] = viewer(request.headers)
     return web.json_response(snap, dumps=lambda d: json.dumps(d, indent=2))
 
 
@@ -511,15 +517,15 @@ def page_api(role):
     """An endpoint the status page calls, by a viewer with `role`; handlers get the URL's {name}."""
     def wrap(handler):
         async def wrapped(request):
-            who = viewer(request.remote, request.headers)
             origin = request.headers.get("origin")
             why = None
-            if not who[role]:
+            if not viewer(request.headers)[role]:
                 why = ROLES[role]
-            elif origin != f"https://{request.host}":  # stops other sites making a signed-in browser call this
+            # Stops other sites making a signed-in browser call this. (Serve passes on the host the browser asked for.)
+            elif origin != f"https://{request.headers.get('x-forwarded-host')}":
                 why = f"request came from {origin or 'no page'}, not the status page"
             if why:
-                log(f"refused {request.method} {request.rel_url.raw_path} from {who['login'] or request.remote}: {why}")
+                log(f"refused {request.method} {request.rel_url.raw_path} from {source(request)}: {why}")
                 return api_error(403, "permission_error", ROLES[role])
             try:
                 done, result = await handler(request, **request.match_info)
@@ -528,7 +534,7 @@ def page_api(role):
             except sqlite3.OperationalError as e:  # e.g. locked by a long write elsewhere
                 log(f"refused {request.method} {request.rel_url.raw_path}: database error ({e})")
                 return api_error(503, "overloaded_error", "The database is busy; try again in a moment.")
-            log(f"{'admin ' if role == 'admin' else ''}{who['login']}: {done}")
+            log(f"{'admin ' if role == 'admin' else ''}{source(request)}: {done}")
             POOL.touch()  # other open status pages show the change right away
             return web.json_response(result, headers={"cache-control": "no-store"})  # may hold a new key
         return wrapped
@@ -549,7 +555,8 @@ async def put_account(request, name):
 @routes.delete("/_gateway/api/accounts/{name}")
 @page_api("admin")
 async def delete_account(_request, name):
-    remove("accounts", "label", name, "account")
+    if not write("DELETE FROM accounts WHERE label = ?", name):
+        raise AdminError(f"No account named '{name}'.")
     return f"removed account {name}", {}
 
 
@@ -564,7 +571,8 @@ async def post_key(_request, name):
 @page_api("admin")
 async def delete_key(_request, name):
     name = name.lower()
-    remove("keys", "name", name, "developer key")  # their history goes at the next tick
+    if not write("DELETE FROM keys WHERE name = ?", name):  # their history goes at the next tick
+        raise AdminError(f"No developer key named '{name}'.")
     return f"removed developer {name}", {}
 
 
@@ -572,7 +580,7 @@ async def delete_key(_request, name):
 @page_api("member")
 async def post_my_key(request):
     # Anyone on the tailnet can get (or replace) the key named after their own login, and only that one.
-    login = viewer(request.remote, request.headers)["login"]
+    login = viewer(request.headers)["login"]
     return "created their own key", {"name": login, "key": new_key(login)}
 
 
@@ -589,9 +597,6 @@ def make_app():
 
     async def lifespan(_app):
         global POOL, CLIENT
-        # The server never waits long for the database: a stuck writer elsewhere (say an open
-        # sqlite3 shell) would otherwise stall every stream. A failed usage save retries next tick.
-        db().execute("PRAGMA busy_timeout = 1000")
         POOL = Pool()
         CLIENT = aiohttp.ClientSession(
             auto_decompress=False,  # pass bytes through untouched
@@ -600,7 +605,7 @@ def make_app():
             connector=aiohttp.TCPConnector(limit=0),
             cookie_jar=aiohttp.DummyCookieJar())  # one account's or developer's cookies never ride along on another's
         task = asyncio.create_task(ticker())
-        log(f"listening on http://{HOST}:{PORT} -> {UPSTREAM} "
+        log(f"listening on {SOCKET} -> {UPSTREAM} "
             f"({len(load_accounts())} accounts, {len(key_names())} developer keys)")
         yield
         task.cancel()
@@ -620,10 +625,22 @@ def make_app():
     return app
 
 
+def main():
+    # Binding replaces the socket file, so a second copy (say `docker compose exec hotpocket hotpocket`)
+    # would take Tailscale serve's way in from the running one, and leave none when it exits.
+    with socket.socket(socket.AF_UNIX) as s:
+        if s.connect_ex(SOCKET) == 0:
+            raise SystemExit(f"hotpocket is already running on {SOCKET}.")
+    os.umask(0o077)  # owner-only files: the database holds account tokens, and the socket believes whoever connects
+    # aiohttp waits shutdown_timeout twice for a request still running, which must fit in Docker's 10 s
+    # stop grace for the final save to run.
+    web.run_app(make_app(), path=SOCKET, shutdown_timeout=4, access_log=None, print=None)
+
+
 # --------------------------------------------------------------------------- admin edits
 
 class AdminError(Exception):
-    """A problem to show the admin, on the command line or on the status page."""
+    """A problem with an edit, to show on the status page."""
 
 
 def check_name(name, what):
@@ -647,58 +664,3 @@ def new_key(name):
     key = "hp-" + secrets.token_urlsafe(24)
     write("INSERT OR REPLACE INTO keys VALUES (?, ?, ?)", name, key_hash(key), time.time())
     return key
-
-
-def remove(table, column, value, what):
-    if not write(f"DELETE FROM {table} WHERE {column} = ?", value):
-        raise AdminError(f"No {what} named '{value}'.")
-
-
-# --------------------------------------------------------------------------- command line
-# Only serving and the admin list live here: making someone an admin needs access to the
-# gateway's host. Everything else is on the status page.
-
-def admin_add(args):
-    login = args.login.lower()
-    check_name(login, "Admin")
-    write("INSERT OR IGNORE INTO admins VALUES (?, ?)", login, time.time())
-    print(f"{login} can now manage accounts and keys at https://<gateway>.")
-
-
-def admin_rm(args):
-    login = args.login.lower()
-    remove("admins", "login", login, "admin")
-    print(f"{login} can no longer manage hotpocket from the web.")
-
-
-def admin_list(_args):
-    logins = [login for (login,) in db().execute("SELECT login FROM admins ORDER BY added")]
-    print("\n".join(logins) or "No admins. Add one with: hotpocket admin add LOGIN")
-
-
-def main():
-    os.umask(0o077)  # the database holds account tokens: owner-only files
-    parser = argparse.ArgumentParser(prog="hotpocket", description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    commands = parser.add_subparsers(required=True, metavar="COMMAND")
-    commands.add_parser("serve", help="run the gateway on HOTPOCKET_HOST:HOTPOCKET_PORT "
-                        "(default 127.0.0.1:8080)").set_defaults(run=lambda _: web.run_app(
-        # aiohttp waits shutdown_timeout twice for a request still running, which must fit in Docker's 10 s
-        # stop grace for the final save to run.
-        make_app(), host=HOST, port=PORT, shutdown_timeout=4, access_log=None, print=None))
-    admins = commands.add_parser("admin", help="Tailscale logins that may manage accounts and keys "
-                                 "on the status page").add_subparsers(required=True, metavar="ACTION")
-    for name, run, help in (("add", admin_add, "make a Tailscale login an admin"),
-                            ("rm", admin_rm, "take that away")):
-        action = admins.add_parser(name, help=help)
-        action.add_argument("login")
-        action.set_defaults(run=run)
-    admins.add_parser("list", help="list admins").set_defaults(run=admin_list)
-
-    args = parser.parse_args()
-    try:
-        args.run(args)
-    except AdminError as e:
-        parser.exit(1, f"{e}\n")
-    except sqlite3.OperationalError as e:
-        parser.exit(1, f"Can't use the database in {DATA} ({e}).\n")

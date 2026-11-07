@@ -1,8 +1,8 @@
 """hotpocket's tests: the gateway in-process, against a fake Anthropic API. Run: uv run pytest"""
 import asyncio
+import json
 import os
 import sqlite3
-import subprocess
 import sys
 import time
 
@@ -15,6 +15,7 @@ import hotpocket
 U = hotpocket.UNIFIED
 SEEN = web.AppKey("seen", list)  # what the fake API was sent
 TOKEN = "sk-ant-oat01-NEW"
+HOST = "hotpocket.example.ts.net"
 
 
 async def fake_api(request):
@@ -67,13 +68,12 @@ def data(tmp_path, monkeypatch):
 
 @pytest.fixture
 async def gw(data, aiohttp_server, aiohttp_client, monkeypatch):
-    """A gateway with two accounts (the first one at its usage limit), a key for alice and an admin."""
+    """A gateway with two accounts (the first one at its usage limit) and a key for alice."""
     api = web.Application()
     api[SEEN] = []
     api.router.add_route("*", "/{tail:.*}", fake_api)
     monkeypatch.setattr(hotpocket, "UPSTREAM", str((await aiohttp_server(api)).make_url("")).rstrip("/"))
     use_accounts("LIMITED", "GOOD")
-    hotpocket.write("INSERT INTO admins VALUES ('admin@example.com', 0)")
     client = await aiohttp_client(hotpocket.make_app())
     client.seen, client.dev = api[SEEN], dev(hotpocket.new_key("alice"))
     return client
@@ -101,22 +101,19 @@ async def status(gw, headers=None):
     return {**snap, "accounts": {a["label"]: a for a in snap["accounts"]}}
 
 
-def as_user(gw, login="admin@example.com", origin="page"):
-    """What Tailscale serve and the browser add when someone uses the status page."""
-    headers = {"tailscale-user-login": login, "origin": f"https://{gw.host}:{gw.port}" if origin == "page" else origin}
+def as_user(login="admin@example.com", origin="page"):
+    """What Tailscale serve and the browser add when someone uses the status page. The tailnet policy
+    grants admin@example.com the admin capability."""
+    caps = {hotpocket.ADMIN_CAP: [{}]} if (login or "").lower() == "admin@example.com" else {}
+    headers = {"tailscale-user-login": login, "tailscale-app-capabilities": json.dumps(caps),
+               "x-forwarded-host": HOST, "origin": f"https://{HOST}" if origin == "page" else origin}
     return {k: v for k, v in headers.items() if v}
 
 
 async def manage(gw, method, path, body=None, **who):
-    resp = await gw.request(method, "/_gateway/api/" + path, json=body, headers=as_user(gw, **who))
+    resp = await gw.request(method, "/_gateway/api/" + path, json=body, headers=as_user(**who))
     assert resp.status != 200 or resp.headers["cache-control"] == "no-store"  # may hold a new key
     return resp.status, await resp.json()
-
-
-def cli(data, *args):
-    r = subprocess.run([sys.executable, "-m", "hotpocket", *args], capture_output=True, text=True,
-                       env=dict(os.environ, HOTPOCKET_DATA=str(data)))
-    return r.returncode, r.stdout + r.stderr
 
 
 # --------------------------------------------------------------------------- proxying
@@ -258,6 +255,21 @@ async def test_a_revoked_token_is_blocked_and_any_other_403_tries_the_next_accou
     assert resp.status == 403 and b"NOMODEL says no" in body  # no account takes it: Anthropic's own answer
 
 
+async def test_rejected_tokens_get_a_try_when_nothing_else_is_left(gw):
+    # So if Anthropic rejected every token at once, the first request after it recovers brings the pool back.
+    use_accounts("GOOD")
+    hotpocket.POOL.block("good", "sk-ant-oat01-GOOD", "auth", time.time() + 600)
+    assert (await call(gw))[0].status == 200
+    assert (await status(gw))["accounts"]["good"]["available"]
+    # Tokens that stay rejected cost each request one try, the longest-rejected first, not one per token.
+    use_accounts("BAD", "REVOKED")
+    for tok in ("BAD", "REVOKED"):
+        hotpocket.POOL.block(tok.lower(), f"sk-ant-oat01-{tok}", "auth", time.time() + 600)
+    for expected in ("BAD", "REVOKED", "BAD"):
+        seen = len(gw.seen)
+        assert (await call(gw))[0].status == 403 and [s["tok"] for s in gw.seen[seen:]] == [expected]
+
+
 async def test_rejected_token_is_403_and_its_replacement_used_at_once(gw):
     use_accounts("BAD")
     resp, body = await call(gw)
@@ -345,14 +357,15 @@ def test_a_window_past_its_reset_reads_zero():
 
 # --------------------------------------------------------------------------- managing from the page
 
-async def test_the_page_learns_who_is_viewing_only_from_this_host(gw):
-    snap = await status(gw, headers=as_user(gw, login="Admin@Example.com"))
-    assert snap["viewer"] == {"login": "admin@example.com", "member": True, "admin": True}
-    assert not hotpocket.viewer("100.64.0.9", as_user(gw))["admin"]
+async def test_the_page_learns_who_is_viewing_and_who_is_an_admin_from_tailscale(gw):
+    for login, viewer in (("Admin@Example.com", {"login": "admin@example.com", "member": True, "admin": True}),
+                          ("bob@example.com", {"login": "bob@example.com", "member": True, "admin": False}),
+                          (None, {"login": None, "member": False, "admin": False})):  # a tagged device
+        assert (await status(gw, headers=as_user(login)))["viewer"] == viewer
 
 
 async def test_managing_needs_https_from_the_page_and_admin_for_accounts(gw):
-    for who in ({"origin": f"http://{gw.host}:{gw.port}"}, {"origin": "https://evil.example"}, {"origin": None},
+    for who in ({"origin": f"http://{HOST}"}, {"origin": "https://evil.example"}, {"origin": None},
                 {"login": None}):
         for method, path in (("PUT", "accounts/web"), ("POST", "my-key")):
             assert (await manage(gw, method, path, {"token": TOKEN}, **who))[0] == 403, (path, who)
@@ -407,24 +420,7 @@ async def test_locked_database_gives_the_page_a_503(gw):
     assert status_ == 503 and "busy" in res["error"]["message"]
 
 
-async def test_cli_and_page_edits_at_the_same_time_all_land(gw, data):
-    results = await asyncio.gather(*(asyncio.to_thread(cli, data, "admin", "add", f"cli{i}@x.com") for i in range(5)),
-                                   *(manage(gw, "POST", f"keys/web{i}") for i in range(5)))
-    assert [r[0] for r in results] == [0] * 5 + [200] * 5
-    assert {f"web{i}" for i in range(5)} <= set(hotpocket.key_names())
-    admins = {login for (login,) in hotpocket.db().execute("SELECT login FROM admins")}
-    assert {f"cli{i}@x.com" for i in range(5)} <= admins
-
-
-async def test_removed_admin_can_no_longer_manage(gw, data):
-    assert cli(data, "admin", "add", "Carol@Example.com")[0] == 0
-    assert (await manage(gw, "POST", "keys/x", login="carol@example.com"))[0] == 200
-    assert cli(data, "admin", "list") == (0, "admin@example.com\ncarol@example.com\n")
-    assert cli(data, "admin", "rm", "Carol@Example.com")[0] == 0
-    assert (await manage(gw, "POST", "keys/y", login="carol@example.com"))[0] == 403
-
-
-# --------------------------------------------------------------------------- storage and command line
+# --------------------------------------------------------------------------- storage and serving
 
 def test_keys_are_stored_only_as_hashes(data):
     key = hotpocket.new_key("alice")
@@ -432,9 +428,20 @@ def test_keys_are_stored_only_as_hashes(data):
     assert key.encode() not in stored and hotpocket.key_hash(key).encode() in stored
 
 
-def test_command_line(tmp_path):
-    assert cli(tmp_path, "admin", "list") == (0, "No admins. Add one with: hotpocket admin add LOGIN\n")
-    rc, out = cli(tmp_path, "admin", "add", "not a login")
-    assert rc == 1 and "names are" in out
-    assert cli(tmp_path, "admin", "add", "a@example.com")[0] == 0
-    assert {oct(f.stat().st_mode & 0o777) for f in tmp_path.iterdir()} == {"0o600"}  # owner-only files
+async def test_it_serves_on_its_socket_with_owner_only_files(tmp_path):
+    sock = tmp_path / "hotpocket.sock"
+    server = await asyncio.create_subprocess_exec(sys.executable, "-m", "hotpocket",
+                                                  env=dict(os.environ, HOTPOCKET_DATA=str(tmp_path), HOTPOCKET_SOCKET=str(sock)))
+    try:
+        async with asyncio.timeout(10):
+            while not sock.exists():
+                await asyncio.sleep(0.05)
+        async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(str(sock))) as http:
+            assert (await http.get("http://hotpocket/api/hello")).status == 200
+        assert all(f.stat().st_mode & 0o077 == 0 for f in tmp_path.iterdir())  # the database and the socket
+        second = await asyncio.create_subprocess_exec(sys.executable, "-m", "hotpocket", stderr=asyncio.subprocess.PIPE,
+                                                      env=dict(os.environ, HOTPOCKET_DATA=str(tmp_path), HOTPOCKET_SOCKET=str(sock)))
+        assert b"already running" in (await asyncio.wait_for(second.communicate(), 10))[1] and second.returncode == 1
+    finally:
+        server.terminate()
+        await server.wait()
