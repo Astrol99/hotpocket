@@ -3,17 +3,19 @@ and the edits made on it: accounts and anyone's key by admins, and anyone's own 
 
 import asyncio
 import json
+import logging
 import sqlite3
 from pathlib import Path
 
 from aiohttp import web
 
-from .log import log, refused
 from .pool import POOL
 from .proxy import api_error
 from .store import (EditError, key_names, load_accounts, new_key, remove_account, remove_key,
                     save_account)
-from .tailscale import source, viewer
+from .tailscale import refused, source, viewer
+
+log = logging.getLogger(__name__)
 
 STATIC = Path(__file__).with_name("static")
 PAGE_HEADERS = {

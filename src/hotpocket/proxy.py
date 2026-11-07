@@ -3,6 +3,7 @@ from the pool, trying the next account when one turns a request down, with the r
 
 import asyncio
 import json
+import logging
 import math
 import os
 import time
@@ -13,10 +14,12 @@ from humanize import naturaldelta
 from multidict import CIMultiDict
 from yarl import URL
 
-from .log import log, refused
 from .pool import POOL
 from .store import key_owner, load_accounts
+from .tailscale import refused
 from .usage import UNIFIED, reset_time, usage_of
+
+log = logging.getLogger(__name__)
 
 UPSTREAM = os.environ.get("HOTPOCKET_UPSTREAM", "https://api.anthropic.com").rstrip("/")
 OAUTH_BETA = "oauth-2025-04-20"  # the beta that lets subscription (OAuth) tokens call the API

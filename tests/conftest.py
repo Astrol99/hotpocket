@@ -3,6 +3,7 @@ Run them with: uv run pytest"""
 
 import asyncio
 import json
+import logging
 import time
 
 import pytest
@@ -66,9 +67,10 @@ def data(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-async def gw(data, aiohttp_server, aiohttp_client, monkeypatch):
+async def gw(data, aiohttp_server, aiohttp_client, monkeypatch, caplog):
     """A gateway with two accounts (the first one at its usage limit) and a key for alice. Also has what the
     fake API was sent (seen), the gateway's pool, and alice's request headers (dev)."""
+    caplog.set_level(logging.INFO, logger="hotpocket")  # as server.main sets it
     api = web.Application()
     api[SEEN] = []
     api.router.add_route("*", "/{tail:.*}", fake_api)

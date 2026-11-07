@@ -2,15 +2,17 @@
 used. It all runs on the event loop's one thread, so no locks are needed."""
 
 import asyncio
+import logging
 import time
 from collections import Counter
 
 from aiohttp import web
 from humanize import naturaldelta
 
-from .log import log
 from .store import key_hash, key_names, load_accounts, save_usage, saved_usage
 from .usage import TOKEN_FIELDS, WINDOWS, api_cost, limits
+
+log = logging.getLogger(__name__)
 
 STICKY_MAX_UTIL = 0.95  # a session moves off its account above this use
 SESSION_TTL = 6 * 3600  # a session not seen for this long is forgotten

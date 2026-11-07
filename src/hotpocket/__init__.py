@@ -7,5 +7,4 @@
     page       the status page (its files are in static/) and the edits made on it
     tailscale  who is asking
     store      the database
-    log        log lines
 """

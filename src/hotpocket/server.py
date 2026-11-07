@@ -4,15 +4,17 @@ Tailscale serve reaches it through."""
 import asyncio
 import logging
 import os
+import re
 import socket
 import sqlite3
 
 from aiohttp import web
 
 from . import page, proxy
-from .log import log
 from .pool import POOL, Pool
 from .store import key_names, load_accounts
+
+log = logging.getLogger(__name__)
 
 # Tailscale serve's way in, and the only one: whoever reaches it is believed about who they are.
 SOCKET = os.environ.get("HOTPOCKET_SOCKET", "/run/hotpocket/hotpocket.sock")
@@ -31,7 +33,7 @@ async def lifespan(app):
     pool = app[POOL] = Pool()
     ticking = asyncio.create_task(tick(pool))
     log.info(f"listening on {SOCKET} -> {proxy.UPSTREAM} "
-        f"({len(load_accounts())} accounts, {len(key_names())} developer keys)")
+             f"({len(load_accounts())} accounts, {len(key_names())} developer keys)")
     yield
     ticking.cancel()
     pool.tick()
@@ -47,13 +49,24 @@ async def tick(pool):
             log.error(f"could not save usage: {e}")
 
 
+class OneLine(logging.Formatter):
+    """Escapes each log line, so text from a request or an upstream error page can't forge lines in the log
+    (the audit log of every change). Tracebacks, printed after it, stay readable."""
+
+    def formatMessage(self, record):
+        return re.sub(r"[\x00-\x1f\x7f]", lambda m: f"\\x{ord(m[0]):02x}", super().formatMessage(record))
+
+
 def main():
     # Binding replaces the socket file, so a second copy would take Tailscale serve's way in from the
     # running one, and leave none when it exits.
     with socket.socket(socket.AF_UNIX) as s:
         if s.connect_ex(SOCKET) == 0:
             raise SystemExit(f"hotpocket is already running on {SOCKET}.")
-    logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    lines = logging.StreamHandler()  # on stderr, for `docker compose logs`
+    lines.setFormatter(OneLine("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logging.basicConfig(handlers=[lines])  # other libraries' warnings and errors too
+    logging.getLogger("hotpocket").setLevel(logging.INFO)
     os.umask(0o077)  # owner-only files: the database holds account tokens, and the socket believes whoever connects
     # aiohttp waits shutdown_timeout twice for a request still running, which must fit in Docker's 10 s
     # stop grace for the final save to run.

@@ -1,13 +1,13 @@
 """Storage, logging and serving: what's on disk, the log, and the unix socket."""
 
 import asyncio
+import logging
 import sys
 
 import aiohttp
 import pytest
 
 from hotpocket import server, store
-from hotpocket.log import log
 
 
 def test_keys_are_stored_only_as_hashes(data):
@@ -16,10 +16,10 @@ def test_keys_are_stored_only_as_hashes(data):
     assert key.encode() not in stored and store.key_hash(key).encode() in stored
 
 
-def test_log_lines_cannot_be_forged(caplog):
+def test_log_lines_cannot_be_forged():
     # Say an upstream error page: its text is logged, and mustn't start lines of its own.
-    log.warning("refused (429: <html>\n2026-01-01 00:00:00 INFO admin evil: removed developer bob)")
-    assert caplog.records[-1].getMessage() == "refused (429: <html>\\x0a2026-01-01 00:00:00 INFO admin evil: removed developer bob)"
+    record = logging.makeLogRecord({"msg": "(429: <html>\n2026-01-01 00:00:00 INFO forged)"})
+    assert server.OneLine("%(message)s").format(record) == "(429: <html>\\x0a2026-01-01 00:00:00 INFO forged)"
 
 
 async def test_it_serves_on_its_socket_with_owner_only_files(tmp_path, monkeypatch):
