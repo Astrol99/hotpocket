@@ -1,7 +1,6 @@
 """hotpocket's tests: the gateway in-process, against a fake Anthropic API. Run: uv run pytest"""
 import asyncio
 import json
-import os
 import sqlite3
 import sys
 import time
@@ -49,7 +48,7 @@ async def fake_api(request):
         if tok == "TRUNC":
             request.transport.close()  # gone mid-stream, without the final chunk
             return resp
-        await asyncio.sleep(0.3 if tok == "SLOW" else 0)
+        await asyncio.sleep(0.3 if tok == "SLOW" and "start" in event else 0)
     await resp.write_eof()
     return resp
 
@@ -98,7 +97,8 @@ async def call(gw, headers=None, data=b'{"model": "x"}'):
 
 async def status(gw, headers=None):
     snap = await (await gw.get("/_gateway/status", headers=headers)).json()
-    return {**snap, "accounts": {a["label"]: a for a in snap["accounts"]}}
+    return {**snap, "accounts": {a["label"]: a for a in snap["accounts"]},
+            "developers": {d["name"]: d for d in snap["developers"]}}
 
 
 def as_user(login="admin@example.com", origin="page"):
@@ -122,10 +122,8 @@ async def test_routes_that_never_reach_the_api(gw, capsys):
     assert (await gw.head("/api/hello")).status == 200  # Claude Code's keyless connectivity check
     assert (await gw.get("/favicon.ico")).status == 403
     assert "favicon" not in capsys.readouterr().out  # browser probes leave no log line
-    for path in ("/", "/_gateway"):  # both lead to the page, at /_gateway/ where its relative links work
-        assert (await gw.get(path, allow_redirects=False)).headers["location"] == "/_gateway/"
-    assert gw.seen == []  # an API call over plain HTTP never reaches Anthropic
-    resp = await gw.get("/")
+    resp = await gw.get("/")  # the status page
+    assert gw.seen == []  # none of these reached Anthropic
     assert "<title>hotpocket</title>" in await resp.text()
     assert "frame-ancestors 'none'" in resp.headers["content-security-policy"]
     assert resp.headers["content-type"] == "text/html; charset=utf-8"
@@ -160,7 +158,7 @@ async def test_responses_stream_through_as_they_arrive(gw):
     await resp.content.readany()
     first = time.monotonic() - started
     await resp.read()
-    assert first < 0.25 and time.monotonic() - started > 0.8
+    assert first < 0.25 and time.monotonic() - started > 0.3
 
 
 async def test_headers_going_up_and_coming_back(gw):
@@ -193,14 +191,14 @@ async def test_chunked_request_body(gw):
     assert gw.seen[-1]["body"] == b'{"model": "chunked"}'
 
 
-async def test_absolute_form_target_is_refused_before_reaching_upstream(gw):
+async def test_absolute_form_target_goes_to_the_api_not_its_host(gw):
     # "http://evil.example/..." glued onto the upstream URL would send a token elsewhere.
     reader, writer = await asyncio.open_connection(gw.host, gw.port)
     writer.write(f"POST http://evil.example/v1/messages HTTP/1.1\r\nHost: x\r\n"
                  f"authorization: {gw.dev['authorization']}\r\ncontent-length: 2\r\n\r\n{{}}".encode())
     status_line = await reader.readline()
     writer.close()
-    assert b" 400 " in status_line and gw.seen == []
+    assert b" 200 " in status_line and gw.seen[-1]["path"] == "/v1/messages"
 
 
 async def test_all_accounts_limited_looks_like_a_usage_limit(gw):
@@ -220,7 +218,7 @@ async def test_rejected_and_throttled_accounts_are_skipped(gw):
     use_accounts("BAD", "THROTTLE", "GOOD")
     assert (await call(gw))[0].status == 200 and [s["tok"] for s in gw.seen] == ["BAD", "THROTTLE", "GOOD"]
     acc = (await status(gw))["accounts"]
-    assert acc["bad"]["blocked_kind"] == "auth" and acc["throttle"]["available"]  # a plain 429 blocks no one
+    assert acc["bad"]["blocked_kind"] == "auth" and "blocked_kind" not in acc["throttle"]  # a plain 429 blocks no one
 
 
 @pytest.mark.parametrize("suffixes", [["THROTTLE"], ["THROTTLE", "SLOWDOWN"]])
@@ -233,7 +231,7 @@ async def test_a_429_from_every_account_comes_back_as_is_and_blocks_no_one(gw, c
     assert resp.headers.get("retry-after") == ("2" if last == "SLOWDOWN" else None)  # Anthropic's, if any
     assert resp.headers.get("x-should-retry") == ("false" if last == "SLOWDOWN" else None)
     assert resp.content_type == "application/json"
-    assert all(a["available"] for a in (await status(gw))["accounts"].values())
+    assert not any("blocked_kind" in a for a in (await status(gw))["accounts"].values())
     assert f"(429: {last} says no)" in capsys.readouterr().out
 
 
@@ -249,7 +247,7 @@ async def test_a_revoked_token_is_blocked_and_any_other_403_tries_the_next_accou
     use_accounts("REVOKED", "NOMODEL", "GOOD")
     assert (await call(gw))[0].status == 200 and [s["tok"] for s in gw.seen] == ["REVOKED", "NOMODEL", "GOOD"]
     acc = (await status(gw))["accounts"]
-    assert acc["revoked"]["blocked_kind"] == "auth" and acc["nomodel"]["available"]  # that 403 was about the request
+    assert acc["revoked"]["blocked_kind"] == "auth" and "blocked_kind" not in acc["nomodel"]  # that 403 was about the request
     use_accounts("NOMODEL")
     resp, body = await call(gw)
     assert resp.status == 403 and b"NOMODEL says no" in body  # no account takes it: Anthropic's own answer
@@ -260,7 +258,7 @@ async def test_rejected_tokens_get_a_try_when_nothing_else_is_left(gw):
     use_accounts("GOOD")
     hotpocket.POOL.block("good", "sk-ant-oat01-GOOD", "auth", time.time() + 600)
     assert (await call(gw))[0].status == 200
-    assert (await status(gw))["accounts"]["good"]["available"]
+    assert "blocked_kind" not in (await status(gw))["accounts"]["good"]
     # Tokens that stay rejected cost each request one try, the longest-rejected first, not one per token.
     use_accounts("BAD", "REVOKED")
     for tok in ("BAD", "REVOKED"):
@@ -300,10 +298,10 @@ async def test_open_status_pages_hear_when_usage_changes(gw):
 
 async def test_developers_share_the_pool_limits_by_what_their_requests_cost(gw):
     await call(gw)  # alice, on the good account: 42% of its 5-hour limit, 10% of its weekly
-    alice = (await status(gw))["developers"][0]
+    alice = (await status(gw))["developers"]["alice"]
     assert alice["five_hour"] == pytest.approx(0.42 / 2) and alice["seven_day"] == pytest.approx(0.10 / 2)  # 2 accounts
     await call(gw, dev(hotpocket.new_key("bob")))  # bob's request costs the same, so they split it evenly
-    devs = {d["name"]: d for d in (await status(gw))["developers"]}
+    devs = (await status(gw))["developers"]
     assert devs["alice"]["five_hour"] == devs["bob"]["five_hour"] == pytest.approx(0.42 / 2 / 2)
 
 
@@ -325,7 +323,7 @@ async def test_tokens_and_estimated_api_cost_are_counted(gw):
     await call(gw)  # not streamed: Claude Sonnet 5.5, 1000 in + 100 out
     snap = await status(gw)
     assert snap["accounts"]["plain"]["cost"] == pytest.approx((1000 * 2 + 100 * 10) / 1e6)
-    alice = snap["developers"][0]
+    alice = snap["developers"]["alice"]
     assert alice["requests"] == 2 and alice["tokens"]["input_tokens"] == 1100 and alice["cost"] == pytest.approx(0.0026 + 0.003)
     assert time.time() - snap["since"] < 60
 
@@ -337,7 +335,7 @@ async def test_status_shows_usage_blocks_and_developers_but_no_tokens_and_surviv
     assert acc["limited"]["blocked_kind"] == "limit" and acc["limited"]["blocked_until"] > time.time() + 7000
     assert acc["good"]["five_hour"] == 0.42 and acc["good"]["requests"] == 1
     assert time.time() - acc["good"]["usage_at"] < 5  # when that usage was heard, for the page's "as of"
-    assert [(d["name"], d["requests"]) for d in snap["developers"]] == [("alice", 1)]
+    assert {n: d["requests"] for n, d in snap["developers"].items()} == {"alice": 1}
     assert "sk-ant" not in str(snap)
     await gw.close()  # shutting down saves usage
     assert hotpocket.Pool().accounts["limited"]["blocked_until"] > time.time()
@@ -358,9 +356,9 @@ def test_a_window_past_its_reset_reads_zero():
 # --------------------------------------------------------------------------- managing from the page
 
 async def test_the_page_learns_who_is_viewing_and_who_is_an_admin_from_tailscale(gw):
-    for login, viewer in (("Admin@Example.com", {"login": "admin@example.com", "member": True, "admin": True}),
-                          ("bob@example.com", {"login": "bob@example.com", "member": True, "admin": False}),
-                          (None, {"login": None, "member": False, "admin": False})):  # a tagged device
+    for login, viewer in (("Admin@Example.com", {"login": "admin@example.com", "admin": True}),
+                          ("bob@example.com", {"login": "bob@example.com", "admin": False}),
+                          (None, {"login": None, "admin": False})):  # a tagged device
         assert (await status(gw, headers=as_user(login)))["viewer"] == viewer
 
 
@@ -378,13 +376,13 @@ async def test_admin_edits_accounts_and_keys(gw, capsys):
     status_, res = await manage(gw, "PUT", "accounts/bad%20label", {"token": TOKEN})
     assert status_ == 400 and "names are" in res["error"]["message"]
     assert (await manage(gw, "PUT", "accounts/.", {"token": TOKEN}))[0] in (400, 403, 404)
-    with pytest.raises(hotpocket.AdminError):
+    with pytest.raises(hotpocket.EditError):
         hotpocket.new_key("..")
     _, res = await manage(gw, "POST", "keys/bob")
     assert (await call(gw, dev(res["key"], "bob")))[0].status == 200
     assert (await manage(gw, "DELETE", "keys/BOB"))[0] == 200  # names ignore case, like Tailscale logins
     assert (await call(gw, dev(res["key"], "bob")))[0].status == 403
-    assert "bob" not in {d["name"] for d in (await status(gw))["developers"]}  # removed, history and all
+    assert "bob" not in (await status(gw))["developers"]  # removed, history and all
     assert (await manage(gw, "DELETE", "accounts/good"))[0] == 200
     assert await manage(gw, "DELETE", "accounts/good") == (400, {"type": "error", "error": {"type": "invalid_request_error", "message": "No account named 'good'."}})
     log = capsys.readouterr().out
@@ -395,7 +393,7 @@ async def test_admin_edits_accounts_and_keys(gw, capsys):
 
 async def test_members_get_and_replace_only_their_own_key(gw, capsys):
     status_, first = await manage(gw, "POST", "my-key", login="Bob@Example.com")
-    assert status_ == 200 and first["name"] == "bob@example.com"
+    assert status_ == 200 and "bob@example.com" in (await status(gw))["developers"]
     assert (await call(gw, dev(first["key"])))[0].status == 200
     _, second = await manage(gw, "POST", "my-key", login="bob@example.com")
     assert (await call(gw, dev(first["key"])))[0].status == 403
@@ -428,10 +426,11 @@ def test_keys_are_stored_only_as_hashes(data):
     assert key.encode() not in stored and hotpocket.key_hash(key).encode() in stored
 
 
-async def test_it_serves_on_its_socket_with_owner_only_files(tmp_path):
+async def test_it_serves_on_its_socket_with_owner_only_files(tmp_path, monkeypatch):
     sock = tmp_path / "hotpocket.sock"
-    server = await asyncio.create_subprocess_exec(sys.executable, "-m", "hotpocket",
-                                                  env=dict(os.environ, HOTPOCKET_DATA=str(tmp_path), HOTPOCKET_SOCKET=str(sock)))
+    monkeypatch.setenv("HOTPOCKET_DATA", str(tmp_path))
+    monkeypatch.setenv("HOTPOCKET_SOCKET", str(sock))
+    server = await asyncio.create_subprocess_exec(sys.executable, "-c", "import hotpocket; hotpocket.main()")
     try:
         async with asyncio.timeout(10):
             while not sock.exists():
@@ -439,9 +438,9 @@ async def test_it_serves_on_its_socket_with_owner_only_files(tmp_path):
         async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(str(sock))) as http:
             assert (await http.get("http://hotpocket/api/hello")).status == 200
         assert all(f.stat().st_mode & 0o077 == 0 for f in tmp_path.iterdir())  # the database and the socket
-        second = await asyncio.create_subprocess_exec(sys.executable, "-m", "hotpocket", stderr=asyncio.subprocess.PIPE,
-                                                      env=dict(os.environ, HOTPOCKET_DATA=str(tmp_path), HOTPOCKET_SOCKET=str(sock)))
-        assert b"already running" in (await asyncio.wait_for(second.communicate(), 10))[1] and second.returncode == 1
+        monkeypatch.setattr(hotpocket, "SOCKET", str(sock))
+        with pytest.raises(SystemExit, match="already running"):  # a second copy
+            hotpocket.main()
     finally:
         server.terminate()
         await server.wait()

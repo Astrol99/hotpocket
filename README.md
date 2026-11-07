@@ -88,7 +88,7 @@ HOTPOCKET_DATA=./data HOTPOCKET_SOCKET=./data/hotpocket.sock uv run hotpocket   
 curl --unix-socket ./data/hotpocket.sock http://hotpocket/_gateway/status
 ```
 
-Settings are environment variables: `HOTPOCKET_DATA` (where `hotpocket.db` lives) and
+Settings are environment variables: `HOTPOCKET_DATA` (where `hotpocket.db` lives, default `/data`) and
 `HOTPOCKET_SOCKET` (default `/run/hotpocket/hotpocket.sock`). To use a local copy
 from Claude Code, put it behind
 `tailscale serve --accept-app-caps github.com/astrol99/hotpocket/admin unix:$PWD/data/hotpocket.sock`

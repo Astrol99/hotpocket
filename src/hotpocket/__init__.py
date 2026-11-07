@@ -21,7 +21,7 @@ from genai_prices import extract_usage
 from multidict import CIMultiDict
 from yarl import URL
 
-DATA = Path(os.environ.get("HOTPOCKET_DATA", "/var/lib/hotpocket"))  # holds hotpocket.db
+DATA = Path(os.environ.get("HOTPOCKET_DATA", "/data"))  # holds hotpocket.db
 UPSTREAM = os.environ.get("HOTPOCKET_UPSTREAM", "https://api.anthropic.com").rstrip("/")
 # Tailscale serve's way in, and the only one: whoever reaches it is believed about who they are.
 SOCKET = os.environ.get("HOTPOCKET_SOCKET", "/run/hotpocket/hotpocket.sock")
@@ -46,12 +46,11 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", 
        "trailer", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
 NOT_UPSTREAM = HOP | {"authorization", "x-api-key", "x-hotpocket-key", "accept-encoding", "anthropic-beta"}
 NOT_DOWNSTREAM = HOP | {"server", "date"}
-CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def log(msg):
     # Escaped, so a request path like /v1/%0A... can't forge lines in the (audit) log.
-    msg = CONTROL_RE.sub(lambda m: f"\\x{ord(m[0]):02x}", msg)
+    msg = re.sub(r"[\x00-\x1f\x7f]", lambda m: f"\\x{ord(m[0]):02x}", msg)
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
 
@@ -236,13 +235,10 @@ class Pool:
             rejected = a.get("blocked_kind") == "auth" and a.get("blocked_token") == key_hash(token)[:16]
             blocked = rejected or self.blocked(label, token, now)
             rows.append({
-                "label": label, "available": not blocked,
-                "blocked_kind": a["blocked_kind"] if blocked else None,
-                "blocked_reason": REASONS[a["blocked_kind"]] if blocked else None,
-                "blocked_until": a["blocked_until"] if blocked else None,
-                **{w: used(a, w, now) for w in WINDOWS}, **{w + "_reset": a.get(w + "_reset") for w in WINDOWS},
-                "usage_at": a.get("usage_at"), "requests": a.get("requests", 0),
-                "tokens": a.get("tokens", {}), "cost": a.get("cost", 0),
+                "label": label, **{w: used(a, w, now) for w in WINDOWS},
+                **{k: a.get(k) for k in ("usage_at", "requests", "tokens", "cost", *(w + "_reset" for w in WINDOWS))},
+                **({"blocked_kind": a["blocked_kind"], "blocked_reason": REASONS[a["blocked_kind"]],
+                    "blocked_until": a["blocked_until"]} if blocked else {}),
             })
             # Developers' shares of the pool's limits: the account's use in its current window, split between
             # the developers who used it by what their requests would cost at API prices.
@@ -251,7 +247,7 @@ class Pool:
                 if spent and (spent["reset"] or 0) > now and (total := sum(spent["devs"].values())):
                     for dev, cost in spent["devs"].items():
                         shares[w][dev] += use * cost / total / len(accounts)
-        devs = [{"name": n, "requests": 0, **self.devs.get(n, {}), **{w: shares[w][n] for w in WINDOWS}} for n in keys]
+        devs = [{"name": n, **self.devs.get(n, {}), **{w: shares[w][n] for w in WINDOWS}} for n in keys]
         return {"accounts": rows, "developers": devs, "since": self.since}
 
     def tick(self):
@@ -320,9 +316,6 @@ async def proxy(request):
         # The gateway never sends 401: Claude Code retries a 401 for minutes before giving up.
         return api_error(403, "permission_error", "hotpocket: missing or unknown developer key. "
                          "Get a new one on the hotpocket status page and paste its setup prompt into Claude Code.")
-    if not request.raw_path.startswith("/"):
-        # An absolute-form target ("http://host/...") would be glued onto UPSTREAM's host.
-        return api_error(400, "invalid_request_error", "hotpocket: request target must be a path.")
     tag = f"{dev} {request.method} {request.path}"
     accounts = load_accounts()
     if not accounts:
@@ -330,7 +323,7 @@ async def proxy(request):
     body = await request.read()  # buffered so the request can be resent on another account
     session = request.headers.get("x-claude-code-session-id") or f"dev:{dev}"
     headers = upstream_headers(request.headers)
-    url = URL(UPSTREAM + request.raw_path, encoded=True)
+    url = URL(UPSTREAM + request.rel_url.raw_path_qs, encoded=True)  # even "http://host/..." comes as just a path
     tried, refused = [], None
     while (label := POOL.choose(accounts, session, tried)) is not None:
         tried.append(label)
@@ -422,7 +415,6 @@ def all_blocked(tag, accounts):
     timed = [b for b in blocks if b.get("blocked_kind") != "auth"] or blocks
     first = min(timed, key=lambda b: b.get("blocked_until", 0))  # the first back, whose limit is the one named
     reset = max(first.get("blocked_until", 0), time.time() + 1)
-    retry = {"retry-after": str(math.ceil(reset - time.time()))}
     log(f"{tag}: all {len(blocks)} accounts blocked ({', '.join(sorted(map(str, kinds)))}); "
         f"first back in {until_text(reset)}")
     if kinds == {"auth"}:
@@ -435,14 +427,15 @@ def all_blocked(tag, accounts):
                      f"hotpocket: all {len(blocks)} team accounts are at their usage limit "
                      f"or unavailable. The first one is back in {until_text(reset)}.",
                      headers={UNIFIED + "status": "rejected", UNIFIED + "reset": str(math.ceil(reset)),
-                              UNIFIED + "representative-claim": claim, **retry})
+                              UNIFIED + "representative-claim": claim,
+                              "retry-after": str(math.ceil(reset - time.time()))})
 
 
 # --------------------------------------------------------------------------- status page
 
 routes = web.RouteTableDef()
 PAGE_HEADERS = {
-    "cache-control": "no-store", "referrer-policy": "no-referrer",
+    "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer",
     # No framing (clickjacking), no third-party anything, and forms only submit through the page's script.
     "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
                                "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
@@ -450,12 +443,10 @@ PAGE_HEADERS = {
 
 
 def viewer(headers):
-    """Who is asking and what they may do: a "member" (signed in to Tailscale) may get their own key;
-    an "admin" may manage the gateway. Tailscale serve replaces these headers on every request: the login
-    (none for tagged devices), and the capabilities it is told to pass on, with what each grant says."""
+    """Who is asking: their Tailscale login (none for a tagged device), which may get its own key, and whether
+    the tailnet policy grants them admin, to manage the gateway. Tailscale serve replaces both on every request."""
     login = (headers.get("tailscale-user-login") or "").lower() or None
-    admin = ADMIN_CAP in json.loads(headers.get("tailscale-app-capabilities") or "{}")
-    return {"login": login, "member": bool(login), "admin": admin}
+    return {"login": login, "admin": ADMIN_CAP in json.loads(headers.get("tailscale-app-capabilities") or "{}")}
 
 
 def source(request):
@@ -492,15 +483,8 @@ async def status_json(request):
 
 
 @routes.get("/")
-@routes.get("/_gateway")
-async def to_status_page(_request):
-    raise web.HTTPFound("/_gateway/")  # where the page's relative links resolve
-
-
-@routes.get("/_gateway/")
 async def status_page(_request):
-    return web.FileResponse(Path(__file__).with_name("ui.html"),
-                            headers={**PAGE_HEADERS, "content-type": "text/html; charset=utf-8"})
+    return web.FileResponse(Path(__file__).with_name("ui.html"), headers=PAGE_HEADERS)
 
 
 @routes.get("/api/hello")
@@ -510,11 +494,11 @@ async def hello(_request):
 
 
 ROLES = {"admin": "Only hotpocket admins can do this.",  # why a viewer without the role is refused
-         "member": "Tailscale didn't say who you are (a tagged device?), so open this page on your own device."}
+         "login": "Tailscale didn't say who you are (a tagged device?), so open this page on your own device."}
 
 
 def page_api(role):
-    """An endpoint the status page calls, by a viewer with `role`; handlers get the URL's {name}."""
+    """An endpoint the status page calls, by a viewer with `role` (a login, or admin); handlers get the URL's {name}."""
     def wrap(handler):
         async def wrapped(request):
             origin = request.headers.get("origin")
@@ -529,7 +513,7 @@ def page_api(role):
                 return api_error(403, "permission_error", ROLES[role])
             try:
                 done, result = await handler(request, **request.match_info)
-            except AdminError as e:
+            except EditError as e:
                 return api_error(400, "invalid_request_error", str(e))
             except sqlite3.OperationalError as e:  # e.g. locked by a long write elsewhere
                 log(f"refused {request.method} {request.rel_url.raw_path}: database error ({e})")
@@ -547,7 +531,7 @@ async def put_account(request, name):
     try:
         token = str((await request.json())["token"])
     except (ValueError, KeyError, TypeError):
-        raise AdminError('Expected a JSON body with "token".') from None
+        raise EditError('Expected a JSON body with "token".') from None
     save_account(name, token)
     return f"saved account {name}", {}
 
@@ -556,14 +540,14 @@ async def put_account(request, name):
 @page_api("admin")
 async def delete_account(_request, name):
     if not write("DELETE FROM accounts WHERE label = ?", name):
-        raise AdminError(f"No account named '{name}'.")
+        raise EditError(f"No account named '{name}'.")
     return f"removed account {name}", {}
 
 
 @routes.post("/_gateway/api/keys/{name}")
 @page_api("admin")
 async def post_key(_request, name):
-    name = name.lower()  # as new_key stores it, so the log names the key that exists
+    name = name.lower()  # developer names are usually Tailscale logins, which ignore case
     return f"created a key for {name}", {"key": new_key(name)}
 
 
@@ -572,16 +556,15 @@ async def post_key(_request, name):
 async def delete_key(_request, name):
     name = name.lower()
     if not write("DELETE FROM keys WHERE name = ?", name):  # their history goes at the next tick
-        raise AdminError(f"No developer key named '{name}'.")
+        raise EditError(f"No developer key named '{name}'.")
     return f"removed developer {name}", {}
 
 
 @routes.post("/_gateway/api/my-key")
-@page_api("member")
+@page_api("login")
 async def post_my_key(request):
     # Anyone on the tailnet can get (or replace) the key named after their own login, and only that one.
-    login = viewer(request.headers)["login"]
-    return "created their own key", {"name": login, "key": new_key(login)}
+    return "created their own key", {"key": new_key(viewer(request.headers)["login"])}
 
 
 # --------------------------------------------------------------------------- server
@@ -626,8 +609,8 @@ def make_app():
 
 
 def main():
-    # Binding replaces the socket file, so a second copy (say `docker compose exec hotpocket hotpocket`)
-    # would take Tailscale serve's way in from the running one, and leave none when it exits.
+    # Binding replaces the socket file, so a second copy would take Tailscale serve's way in from the
+    # running one, and leave none when it exits.
     with socket.socket(socket.AF_UNIX) as s:
         if s.connect_ex(SOCKET) == 0:
             raise SystemExit(f"hotpocket is already running on {SOCKET}.")
@@ -637,15 +620,15 @@ def main():
     web.run_app(make_app(), path=SOCKET, shutdown_timeout=4, access_log=None, print=None)
 
 
-# --------------------------------------------------------------------------- admin edits
+# --------------------------------------------------------------------------- edits from the status page
 
-class AdminError(Exception):
+class EditError(Exception):
     """A problem with an edit, to show on the status page."""
 
 
 def check_name(name, what):
     if not NAME_RE.fullmatch(name):
-        raise AdminError(f"{what} names are letters, digits and . _ - @ + % (not only dots, at most 254).")
+        raise EditError(f"{what} names are letters, digits and . _ - @ + % (not only dots, at most 254).")
 
 
 def save_account(label, raw_token):
@@ -653,13 +636,12 @@ def save_account(label, raw_token):
     check_name(label, "Account")
     token = "".join(raw_token.split())
     if not TOKEN_RE.fullmatch(token):
-        raise AdminError("That doesn't look like a Claude Code token (expected sk-ant-oat...).")
+        raise EditError("That doesn't look like a Claude Code token (expected sk-ant-oat...).")
     write("INSERT INTO accounts VALUES (?, ?, (SELECT IFNULL(MAX(position), 0) + 1 FROM accounts)) "
           "ON CONFLICT (label) DO UPDATE SET token = excluded.token", label, token)
 
 
 def new_key(name):
-    name = name.lower()  # developer names are usually Tailscale logins, which ignore case
     check_name(name, "Developer")
     key = "hp-" + secrets.token_urlsafe(24)
     write("INSERT OR REPLACE INTO keys VALUES (?, ?, ?)", name, key_hash(key), time.time())

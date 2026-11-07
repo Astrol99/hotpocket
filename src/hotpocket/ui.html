@@ -184,7 +184,7 @@ function toast(msg) {
 }
 
 async function api(method, path, body) {
-  const r = await fetch('api/' + path, {  // relative to the page, at /_gateway/
+  const r = await fetch('/_gateway/api/' + path, {
     method, headers: {'content-type': 'application/json'},
     body: body === undefined ? undefined : JSON.stringify(body)});
   const data = await r.json().catch(() => ({}));
@@ -223,11 +223,10 @@ function tile(label, value, sub, parts) {
   return t;
 }
 
-// How much of the whole pool's limit is used: every account's use added up, over all of them. An account
-// with no usage data yet counts as unused, and none counts past its own limit.
 const noUsage = w => !snap.accounts.some(a => a[w] != null);
 
-// The pool's use of window w, its bar split by account: each segment is that account's share of the pool's limit.
+// The pool's use of window w: every account's use (none heard yet counts as unused, and none counts past its
+// own limit) over the number of accounts, its bar split into each account's share of the pool's limit.
 function poolUse(w, label) {
   if (noUsage(w)) return tile(label, '–', 'no data yet');
   const parts = snap.accounts.map((a, i) => ({v: Math.min(1, a[w] || 0) / snap.accounts.length, color: color(i),
@@ -253,7 +252,7 @@ function meterCell(a, w, label) {
 }
 
 function stateCell(a) {
-  if (a.available) return h('td', {'data-label': 'State'}, h('span', {class: 'ok'}, '● Ready'));
+  if (!a.blocked_kind) return h('td', {'data-label': 'State'}, h('span', {class: 'ok'}, '● Ready'));
   const reason = a.blocked_reason[0].toUpperCase() + a.blocked_reason.slice(1);
   const next = a.blocked_kind === 'auth' ? 'replace its token' : 'back ' + until(a.blocked_until);
   return h('td', {'data-label': 'State'}, h('span', {class: 'bad'}, '● ' + reason),
@@ -269,9 +268,8 @@ function table(id, cols, rows, none) {
 // Usage is only heard in the API's replies, so it's as old as the account's last request through
 // hotpocket; use elsewhere (claude.ai, a direct login) doesn't show until then. Say so once it's stale.
 function usageAge(a) {
-  if (a.five_hour == null && a.seven_day == null || now() - a.usage_at < 600) return null;
-  return h('div', {class: 'sub', title: clock(a.usage_at)},
-           a.usage_at ? 'usage as of ' + ago(a.usage_at) : 'usage from earlier');
+  if (!a.usage_at || now() - a.usage_at < 600) return null;
+  return h('div', {class: 'sub', title: clock(a.usage_at)}, 'usage as of ' + ago(a.usage_at));
 }
 
 // A Lucide icon from the set at the top of the page, in the text's color.
@@ -304,9 +302,9 @@ function devRow(d) {
     h('td', {'data-label': 'Last account'}, d.last_account || '–'),
     // Your own row has "New key" (to set up again or replace a lost key); admins can do it for anyone.
     h('td', {class: 'actions'}, menu(d.name,
-      d.name === snap.viewer.login ? h('button', {onclick: e => newMyKey(e.currentTarget)}, icon('key-round'), 'New key')
-        : snap.viewer.admin ? h('button', {onclick: e => makeKey(e.currentTarget, d.name, true)}, icon('key-round'), 'New key') : null,
-      snap.viewer.admin ? h('button', {class: 'bad', onclick: e => removeDev(e.currentTarget, d.name)}, icon('trash-2'), 'Remove') : null)));
+      (d.name === snap.viewer.login || snap.viewer.admin) &&
+        h('button', {onclick: e => makeKey(e.currentTarget, d.name)}, icon('key-round'), 'New key'),
+      snap.viewer.admin && h('button', {class: 'bad', onclick: e => removeDev(e.currentTarget, d.name)}, icon('trash-2'), 'Remove'))));
 }
 
 // The developer (each one has a key) under this name, if any.
@@ -316,9 +314,9 @@ function render() {
   const {accounts, developers, viewer} = snap;
   document.body.classList.toggle('is-admin', viewer.admin);
   $('#who').textContent = viewer.login ? viewer.login + (viewer.admin ? ' · admin' : '') : '';
-  $('#access').hidden = viewer.member;
+  $('#access').hidden = Boolean(viewer.login);
   // "Get my key" for anyone signed in who has none yet; once they do, their row has "New key".
-  $('#mine-button').hidden = !viewer.member || Boolean(keyOf(viewer.login));
+  $('#mine-button').hidden = !viewer.login || Boolean(keyOf(viewer.login));
 
   const cost = sum(accounts.map(a => a.cost || 0)), all = sum(accounts.map(a => tokens(a.tokens)));
   $('#tiles').replaceChildren(poolUse('five_hour', '5-hour'), poolUse('seven_day', 'Weekly'),
@@ -335,7 +333,7 @@ function render() {
 
 async function refresh() {
   try {
-    const r = await fetch('status', {cache: 'no-store'});
+    const r = await fetch('/_gateway/status', {cache: 'no-store'});
     if (!r.ok) throw new Error();
     snap = await r.json();
   } catch {
@@ -378,16 +376,21 @@ const removeDev = (button, name) =>
     toast(`Removed ${name}.`);
   });
 
-const makeKey = (button, name, replacing) =>
-  act(button, replacing && `Make a new key for ${name}? Their current key stops working.`,
-      async () => reveal(name, (await api('POST', path('keys', name))).key));
+// A new key for yourself (anyone signed in), or for anyone (admins); asks first when it replaces one.
+function makeKey(button, name) {
+  const mine = name === snap.viewer.login;
+  return act(button, keyOf(name) && (mine ? 'Make a new key? Your old one stops working right away.'
+                                          : `Make a new key for ${name}? Their current key stops working.`),
+             async () => reveal(name, (await api('POST', mine ? 'my-key' : path('keys', name))).key, mine));
+}
+$('#mine-button').addEventListener('click', e => makeKey(e.target, snap.viewer.login));
 
 // A prompt that has Claude Code send its requests through the gateway while staying logged in to
 // claude.ai: the key goes in its own header, so the login (Artifacts, connectors) stays in charge.
-const setupPrompt = (url, key) => `Set up Claude Code to use our team's Claude gateway, hotpocket, while staying \
+const setupPrompt = key => `Set up Claude Code to use our team's Claude gateway, hotpocket, while staying \
 logged in to my claude.ai account (so Artifacts and connectors keep working). In ~/.claude/settings.json (create it \
 if it doesn't exist), add these to the top-level "env" object, keeping everything else in the file:
-  "ANTHROPIC_BASE_URL": "${url}",
+  "ANTHROPIC_BASE_URL": "${location.origin}",
   "ANTHROPIC_CUSTOM_HEADERS": "x-hotpocket-key: ${key}"
 If that "env" also sets ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY, remove them: they would replace my login. Then \
 check it works by running \`claude -p "Reply with OK"\` and tell me what it printed, and that I need to restart \
@@ -399,19 +402,12 @@ function reveal(name, key, mine = false) {
   const env = {ANTHROPIC_BASE_URL: location.origin, ANTHROPIC_AUTH_TOKEN: key};  // for no claude.ai login
   panel.dataset.name = name;
   $('#reveal-title').textContent = mine ? 'Your new key' : `Key for ${name}`;
-  $('#reveal-prompt').textContent = setupPrompt(location.origin, key);
+  $('#reveal-prompt').textContent = setupPrompt(key);
   $('#reveal-snippet').textContent = JSON.stringify({env}, null, 2);
   panel.querySelectorAll('[data-copy]').forEach(b => { b.textContent = 'Copy'; });
   panel.hidden = false;
   panel.scrollIntoView({block: 'nearest', behavior: 'smooth'});
 }
-
-const newMyKey = button =>
-  act(button, keyOf(snap.viewer.login) && 'Make a new key? Your old one stops working right away.', async () => {
-    const r = await api('POST', 'my-key');
-    reveal(r.name, r.key, true);
-  });
-$('#mine-button').addEventListener('click', e => newMyKey(e.target));
 
 document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', async () => {
   await navigator.clipboard.writeText($('#' + b.dataset.copy).textContent);
@@ -436,8 +432,7 @@ $('#account-form').addEventListener('submit', async e => {
 $('#key-form').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target, name = f.elements.dev.value.trim().toLowerCase();
-  const replacing = Boolean(keyOf(name));
-  if (await makeKey(f.querySelector('button'), name, replacing)) { f.reset(); f.hidden = true; }
+  if (await makeKey(f.querySelector('button'), name)) { f.reset(); f.hidden = true; }
 });
 
 refresh();
@@ -448,7 +443,7 @@ setInterval(autoRefresh, 15000);
 // error reply (say a 502 from the proxy while the gateway restarts), so then this starts over.
 let soon = null;
 (function listen() {
-  const events = new EventSource('events');
+  const events = new EventSource('/_gateway/events');
   events.onmessage = () => { soon ??= setTimeout(() => { soon = null; autoRefresh(); }, 1000); };
   events.onerror = () => { if (events.readyState === EventSource.CLOSED) setTimeout(listen, 5000); };
 })();
