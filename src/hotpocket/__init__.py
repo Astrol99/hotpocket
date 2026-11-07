@@ -395,6 +395,15 @@ async def to_status_page(_request):
     raise web.HTTPFound("/_gateway/")  # where the page's relative links resolve
 
 
+@routes.route("*", "/_gateway/https/{domain:[^/]+}{rest:.*}")  # any method: API calls too
+async def to_https(request):
+    # Plain HTTP (http://hotpocket) lands here, with Tailscale serve filling in its own HTTPS
+    # name. Only plain HTTP is redirected, so this can't send anyone to another site.
+    if request.headers.get("x-forwarded-proto") == "https":
+        raise web.HTTPNotFound()
+    raise web.HTTPFound(f"https://{request.match_info['domain']}/")
+
+
 @routes.get("/_gateway/")
 async def status_page(_request):
     return web.FileResponse(Path(__file__).with_name("ui.html"),

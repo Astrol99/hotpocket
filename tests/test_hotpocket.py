@@ -120,6 +120,11 @@ async def test_routes_that_never_reach_the_api(gw, capsys):
     assert "favicon" not in capsys.readouterr().out  # browser probes leave no log line
     for path in ("/", "/_gateway"):  # both lead to the page, at /_gateway/ where its relative links work
         assert (await gw.get(path, allow_redirects=False)).headers["location"] == "/_gateway/"
+    to_https = "/_gateway/https/hotpocket.example.ts.net/"  # where Tailscale serve sends plain HTTP
+    assert (await gw.get(to_https, allow_redirects=False)).headers["location"] == "https://hotpocket.example.ts.net/"
+    assert (await gw.get(to_https, headers={"x-forwarded-proto": "https"})).status == 404  # no open redirect
+    assert (await gw.post(to_https + "v1/messages", headers=gw.dev, allow_redirects=False)).status == 302
+    assert gw.seen == []  # an API call over plain HTTP never reaches Anthropic
     resp = await gw.get("/")
     assert "<title>hotpocket</title>" in await resp.text()
     assert "frame-ancestors 'none'" in resp.headers["content-security-policy"]

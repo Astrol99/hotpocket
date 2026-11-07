@@ -30,10 +30,10 @@ services:
     restart: unless-stopped
 
 configs:
-  serve:  # HTTPS for everything; plain HTTP (http://hotpocket) reaches only the read-only status page
+  serve:  # HTTPS for everything; plain HTTP (http://hotpocket) only redirects to it
     content: |
       {"TCP": {"443": {"HTTPS": true}, "80": {"HTTP": true}},
        "Web": {"$${TS_CERT_DOMAIN}:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8080"}}},
-               "$${TS_CERT_DOMAIN}:80": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8080/_gateway"}}}}}
+               "$${TS_CERT_DOMAIN}:80": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8080/_gateway/https/$${TS_CERT_DOMAIN}"}}}}}
 
 volumes: {tailscale: {}, data: {}}

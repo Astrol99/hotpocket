@@ -59,10 +59,10 @@ Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts
   An update recreates the container and starts a new log, so save it first if you
   need the history.
 
-Managing works only at the full HTTPS address; `http://hotpocket` is a
-read-only view. hotpocket learns who you are from Tailscale serve, which reaches it
-on 127.0.0.1 in the Tailscale container's network, so never publish its port or
-put another proxy in front of it. `hotpocket admin --help` lists the admin commands.
+`http://hotpocket` is a shortcut that redirects there. hotpocket learns who you
+are from Tailscale serve, which reaches it on 127.0.0.1 in the Tailscale
+container's network, so never publish its port or put another proxy in front of it.
+`hotpocket admin --help` lists the admin commands.
 
 ## Development
 
