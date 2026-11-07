@@ -18,18 +18,23 @@ Admin (run on the gateway host)
   hotpocket key add NAME          create a developer key (shown once)
   hotpocket key rm NAME
   hotpocket key list
+  hotpocket admin add LOGIN       let a Tailscale login manage accounts and keys
+  hotpocket admin rm LOGIN          from the status page (https://<gateway>/_gateway)
+  hotpocket admin list
   hotpocket status                accounts, usage and developers
 
-Developers point Claude Code at it (e.g. in ~/.claude/settings.json "env"):
+Developers get a key from the status page (Get my key, for anyone on the tailnet)
+or from `hotpocket key add`, and point Claude Code at the gateway (e.g. in
+~/.claude/settings.json "env"):
   ANTHROPIC_BASE_URL=https://<gateway host>
   ANTHROPIC_AUTH_TOKEN=<developer key>
 """
 
 import asyncio
+import fcntl
 import getpass
 import hashlib
 import hmac
-import html
 import json
 import math
 import os
@@ -39,6 +44,7 @@ import sys
 import time
 import urllib.request
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 
 import aiohttp
@@ -48,6 +54,7 @@ from yarl import URL
 DATA = Path(os.environ.get("HOTPOCKET_DATA", "/var/lib/hotpocket"))
 ACCOUNTS = DATA / "accounts.json"   # {label: token}, in priority order
 KEYS = DATA / "keys.json"           # {developer name: key}
+ADMINS = DATA / "admins.json"       # {Tailscale login: added at}; may manage from the web page
 STATE = DATA / "state.json"         # usage and blocks, survives restarts
 UPSTREAM = os.environ.get("HOTPOCKET_UPSTREAM", "https://api.anthropic.com").rstrip("/")
 HOST = os.environ.get("HOTPOCKET_HOST", "127.0.0.1")
@@ -64,7 +71,9 @@ SESSION_TTL = 6 * 3600
 MAX_BODY = 32 * 1024 * 1024  # the Messages API's own request size limit
 REASONS = {"auth": "token rejected (401)", "limit": "usage limit reached", "throttle": "throttled (429)"}
 
-LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# Account labels, developer names and admin logins. Developer names are often Tailscale logins
+# (you@example.com, you@github); all-dot names are refused because "." and ".." break URLs.
+NAME_RE = re.compile(r"(?!\.+$)[\w.%+@-]{1,254}", re.ASCII)
 TOKEN_RE = re.compile(r"sk-ant-oat[0-9]*-[A-Za-z0-9_-]+")
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
        "trailer", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
@@ -72,7 +81,12 @@ NOT_UPSTREAM = HOP | {"authorization", "x-api-key", "accept-encoding", "anthropi
 NOT_DOWNSTREAM = HOP | {"server", "date"}
 
 
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def log(msg):
+    # Escaped, so a request path like /v1/%0A... can't forge lines in the (audit) log.
+    msg = CONTROL_RE.sub(lambda m: f"\\x{ord(m[0]):02x}", msg)
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
 
@@ -99,6 +113,12 @@ def num(headers, name):
         return None
 
 
+def used(a, window, now):
+    """An account's use of a window (0-1, None if unknown). Once its reset time passes it is back to 0."""
+    reset = a.get(window + "_reset")
+    return 0 if reset is not None and reset <= now else a.get(window)
+
+
 def fingerprint(token):
     return hashlib.sha256(token.encode()).hexdigest()[:16]
 
@@ -106,13 +126,20 @@ def fingerprint(token):
 # --------------------------------------------------------------------------- files
 
 def read_json(path, default):
-    """A missing file is `default`; a corrupt one raises ValueError so it is never overwritten."""
+    """A missing file is `default`; a corrupt one raises ValueError so it is never overwritten.
+
+    Every data file holds one JSON object; anything else (say a hand edit that left a bare
+    string, where `in` would match substrings) counts as corrupt.
+    """
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
     except FileNotFoundError:
         return default
     except json.JSONDecodeError as e:
         raise ValueError(f"{path} is not valid JSON ({e}); fix or remove it") from None
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must hold a JSON object, not {type(data).__name__}; fix or remove it")
+    return data
 
 
 def write_json(path, data):
@@ -131,8 +158,8 @@ def write_json(path, data):
 class Watched:
     """A JSON file that is re-read whenever it changes, so admin edits apply live."""
 
-    def __init__(self, path):
-        self.path, self.mtime, self.data = path, None, {}
+    def __init__(self, path, keep_last_good=True):
+        self.path, self.mtime, self.data, self.keep_last_good = path, None, {}, keep_last_good
 
     def get(self):
         try:
@@ -145,7 +172,11 @@ class Watched:
             try:
                 self.data = read_json(self.path, {})
             except ValueError as e:
-                log(f"{e}; still using the last good copy")
+                if self.keep_last_good:
+                    log(f"{e}; still using the last good copy")
+                else:
+                    self.data = {}
+                    log(f"{e}; treating it as empty")
         return self.data
 
 
@@ -174,12 +205,7 @@ class Pool:
 
     def _util(self, label):
         a, now = self.accounts.get(label, {}), time.time()
-
-        def used(window):  # a window whose reset time has passed is back to 0%
-            reset = a.get(window + "_reset")
-            return 0 if reset is not None and reset <= now else a.get(window) or 0
-
-        return max(used(w) for w in WINDOWS)
+        return max(used(a, w, now) or 0 for w in WINDOWS)
 
     def choose(self, accounts, session, exclude):
         now = time.time()
@@ -206,7 +232,7 @@ class Pool:
         self._acct(label).update(blocked_kind=kind, blocked_until=until, blocked_claim=claim,
                                  blocked_token=fingerprint(token))
         self.dirty = True
-        hint = "; replace it with `hotpocket account add`" if kind == "auth" else ""
+        hint = "; replace its token on the status page or with `hotpocket account add`" if kind == "auth" else ""
         log(f"account {label}: {REASONS[kind]}{hint}; back in {until_text(until)}")
 
     def served(self, label, dev):
@@ -216,7 +242,7 @@ class Pool:
         d["last_seen"], d["last_account"] = time.time(), label
         self.dirty = True
 
-    def snapshot(self, accounts):
+    def snapshot(self, accounts, keys):
         now = time.time()
         active = Counter(l for l, seen in self.sessions.values() if seen > now - 3600)
         rows = []
@@ -228,11 +254,12 @@ class Pool:
                 "blocked_kind": a["blocked_kind"] if blocked else None,
                 "blocked_reason": REASONS.get(a["blocked_kind"]) if blocked else None,
                 "blocked_until": a["blocked_until"] if blocked else None,
-                **{k: a.get(k) for w in WINDOWS for k in (w, w + "_reset")},
+                **{w: used(a, w, now) for w in WINDOWS}, **{w + "_reset": a.get(w + "_reset") for w in WINDOWS},
                 "requests": a.get("requests", 0), "active_sessions": active[label],
             })
-        return {"accounts": rows, "available": sum(r["available"] for r in rows),
-                "developers": [{"name": n, **d} for n, d in sorted(self.devs.items())]}
+        names = [*keys, *sorted(self.devs.keys() - keys)]  # key holders, then past developers
+        devs = [{"name": n, "has_key": n in keys, "requests": 0, **self.devs.get(n, {})} for n in names]
+        return {"accounts": rows, "available": sum(r["available"] for r in rows), "developers": devs}
 
     def tick(self):
         """Every few seconds: forget idle sessions and save state if it changed."""
@@ -245,6 +272,7 @@ class Pool:
 
 ACCOUNT_FILE = Watched(ACCOUNTS)
 KEY_FILE = Watched(KEYS)
+ADMIN_FILE = Watched(ADMINS, keep_last_good=False)  # a broken edit must not keep a removed admin
 POOL: Pool = None
 CLIENT: aiohttp.ClientSession = None
 
@@ -288,8 +316,10 @@ async def proxy(request):
     started = time.time()
     dev = developer(request.headers)
     if dev is None:
-        who = request.headers.get("tailscale-user-login") or request.remote
-        log(f"refused {request.method} {request.path} from {who}: missing or unknown developer key")
+        # Log refused API calls, not browsers asking for /favicon.ico and the like.
+        if request.path.startswith("/v1/") or "authorization" in request.headers or "x-api-key" in request.headers:
+            who = viewer(request.remote, request.headers)["login"] or request.remote
+            log(f"refused {request.method} {request.rel_url.raw_path} from {who}: missing or unknown developer key")
         # The gateway never sends 401: Claude Code retries a 401 for minutes before giving up.
         return api_error(403, "permission_error", "hotpocket: missing or unknown developer key. "
                          "Set ANTHROPIC_AUTH_TOKEN to the key your admin gave you.")
@@ -392,18 +422,45 @@ def all_blocked(tag, accounts):
 
 # --------------------------------------------------------------------------- status page
 
+UI_FILE = Path(__file__).with_name("ui.html")
+UI_PAGE = b""  # read by serve(), so the admin CLI doesn't need it
+PAGE_HEADERS = {
+    "cache-control": "no-store", "referrer-policy": "no-referrer",
+    # No framing (clickjacking), no third-party anything, and forms only submit through the page's script.
+    "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                               "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+}
+
+
+def viewer(remote, headers):
+    """Who is asking (per Tailscale serve), over HTTPS or not, and what they may do: a
+    "member" (signed in to Tailscale, over HTTPS) may get their own key; an "admin" may
+    manage the gateway.
+
+    Tailscale serve replaces these headers on every request it forwards, so they are
+    only believed on connections from this host, where it runs.
+    """
+    if remote not in ("127.0.0.1", "::1"):
+        return {"login": None, "https": False, "member": False, "admin": False}
+    login = (headers.get("tailscale-user-login") or "").lower() or None
+    https = headers.get("x-forwarded-proto") == "https"
+    member = bool(login and https)
+    return {"login": login, "https": https, "member": member, "admin": member and login in ADMIN_FILE.get()}
+
+
 async def health(_request):
-    snap = POOL.snapshot(ACCOUNT_FILE.get())
+    snap = POOL.snapshot(ACCOUNT_FILE.get(), KEY_FILE.get())
     return web.json_response({"ok": True, "accounts": len(snap["accounts"]), "available": snap["available"]})
 
 
-async def status_json(_request):
-    return web.json_response(POOL.snapshot(ACCOUNT_FILE.get()), dumps=lambda d: json.dumps(d, indent=2))
+async def status_json(request):
+    snap = POOL.snapshot(ACCOUNT_FILE.get(), KEY_FILE.get())
+    snap["viewer"] = viewer(request.remote, request.headers)
+    return web.json_response(snap, dumps=lambda d: json.dumps(d, indent=2))
 
 
 async def status_page(_request):
-    return web.Response(text=render_html(POOL.snapshot(ACCOUNT_FILE.get())), content_type="text/html",
-                        headers={"cache-control": "no-store"})
+    return web.Response(body=UI_PAGE, content_type="text/html", charset="utf-8", headers=PAGE_HEADERS)
 
 
 async def hello(_request):
@@ -411,50 +468,83 @@ async def hello(_request):
     return web.json_response({"message": "hello"})
 
 
-def render_html(snap):
-    def when(ts):
-        return f'<time data-ts="{int(ts)}"></time>' if ts else "-"
+ROLES = {  # role -> (why it's refused, for the log; what the page shows)
+    "admin": ("not an admin", "Only hotpocket admins can do this, over HTTPS."),
+    "member": ("not signed in to Tailscale over HTTPS", "Open this page at its https://….ts.net address on Tailscale."),
+}
 
-    rows = []
-    for a in snap["accounts"]:
-        state = ('<span class="ok">ready</span>' if a["available"] else
-                 f'<span class="bad">{html.escape(a["blocked_reason"] or "limited")}</span> until {when(a["blocked_until"])}')
-        rows.append(f"<tr><td>{html.escape(a['label'])}</td><td>{state}</td>"
-                    f"<td>{pct(a['five_hour'])}</td><td>{when(a['five_hour_reset'])}</td>"
-                    f"<td>{pct(a['seven_day'])}</td><td>{when(a['seven_day_reset'])}</td>"
-                    f"<td>{a['active_sessions']}</td><td>{a['requests']}</td></tr>")
-    devs = "".join(f"<tr><td>{html.escape(d['name'])}</td><td>{d['requests']}</td>"
-                   f"<td>{when(d.get('last_seen'))}</td><td>{html.escape(d.get('last_account') or '-')}</td></tr>"
-                   for d in snap["developers"]) or '<tr><td colspan="4">No requests yet</td></tr>'
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="refresh" content="30">
-<title>hotpocket</title><style>
-:root{{--bg:#fff;--fg:#1d1d1f;--mute:#6e6e73;--line:#e5e5ea;--ok:#1a7f37;--bad:#b42318}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#111;--fg:#f2f2f2;--mute:#a1a1a6;--line:#2c2c2e;--ok:#4ac26b;--bad:#ff6b5e}}}}
-body{{background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;margin:0;padding:24px 16px;max-width:960px;margin:auto}}
-h1{{font-size:20px;margin:0 0 4px}}h2{{font-size:16px;margin:28px 0 8px}}p{{color:var(--mute);margin:0}}
-.wrap{{overflow-x:auto}}table{{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}}
-th,td{{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}}
-th{{color:var(--mute);font-weight:500;font-size:13px}}.ok{{color:var(--ok)}}.bad{{color:var(--bad)}}
-</style></head><body>
-<h1>hotpocket</h1><p>{snap['available']} of {len(snap['accounts'])} accounts ready · refreshes every 30s</p>
-<h2>Accounts</h2><div class="wrap"><table><tr><th>Account</th><th>State</th><th>5h used</th><th>5h resets</th>
-<th>7d used</th><th>7d resets</th><th>Active sessions</th><th>Requests</th></tr>{''.join(rows)}</table></div>
-<h2>Developers</h2><div class="wrap"><table><tr><th>Name</th><th>Requests</th><th>Last seen</th><th>Last account</th></tr>{devs}</table></div>
-<script>
-for (const t of document.querySelectorAll('time')) {{
-  const d = new Date(t.dataset.ts * 1000), sameDay = d.toDateString() === new Date().toDateString();
-  t.textContent = d.toLocaleString([], sameDay ? {{hour:'numeric', minute:'2-digit'}} : {{weekday:'short', hour:'numeric', minute:'2-digit'}});
-}}
-</script></body></html>"""
+
+def page_api(role):
+    """An endpoint the status page calls: by a viewer with `role`, from the page itself.
+
+    The handler gets the URL's {name}, if any, as an argument and the viewer as request["who"].
+    """
+    def wrap(handler):
+        async def wrapped(request):
+            who = viewer(request.remote, request.headers)
+            origin = request.headers.get("origin")
+            why = None
+            if not who[role]:
+                why = ROLES[role][0]
+            elif origin != f"https://{request.host}":  # stops other sites making a signed-in browser call this
+                why = f"request came from {origin or 'no page'}, not the status page"
+            if why:
+                log(f"refused {request.method} {request.rel_url.raw_path} from {who['login'] or request.remote}: {why}")
+                return web.json_response({"error": ROLES[role][1]}, status=403)
+            request["who"] = who
+            try:
+                done, result = await handler(request, **request.match_info)
+            except AdminError as e:
+                return web.json_response({"error": str(e)}, status=400)
+            log(f"{'admin ' if role == 'admin' else ''}{who['login']}: {done}")
+            return web.json_response(result, headers={"cache-control": "no-store"})  # may hold a new key
+        return wrapped
+    return wrap
+
+
+@page_api("admin")
+async def put_account(request, name):
+    try:
+        token = str((await request.json())["token"])
+    except (ValueError, KeyError, TypeError):
+        raise AdminError('Expected a JSON body with "token".') from None
+    total = save_account(name, token)
+    return f"saved account {name}", {"accounts": total}
+
+
+@page_api("admin")
+async def delete_account(_request, name):
+    remove(ACCOUNTS, name, "account")
+    return f"removed account {name}", {}
+
+
+@page_api("admin")
+async def post_key(_request, name):
+    return f"created a key for {name.lower()}", {"key": new_key(name)}
+
+
+@page_api("admin")
+async def delete_key(_request, name):
+    revoke_key(name)
+    return f"removed the key for {name.lower()}", {}
+
+
+@page_api("member")
+async def post_my_key(request):
+    # Anyone on the tailnet can get (or replace) the key named after their own login, and only that one.
+    login = request["who"]["login"]
+    if not NAME_RE.fullmatch(login):
+        raise AdminError(f"Your Tailscale login ({login}) can't name a key here; ask a hotpocket admin for one.")
+    return "created their own key", {"name": login, "key": new_key(login)}
 
 
 # --------------------------------------------------------------------------- server
 
 def serve(argv):
-    global POOL
+    global POOL, UI_PAGE
     if argv:
         die("`serve` takes no arguments; set HOTPOCKET_HOST and HOTPOCKET_PORT instead.")
+    UI_PAGE = UI_FILE.read_bytes()
     POOL = Pool()
 
     async def ticker():
@@ -486,6 +576,11 @@ def serve(argv):
     app.router.add_get("/_gateway/status", status_json)
     app.router.add_get("/_gateway/health", health)
     app.router.add_get("/api/hello", hello)
+    app.router.add_put("/_gateway/api/accounts/{name}", put_account)
+    app.router.add_delete("/_gateway/api/accounts/{name}", delete_account)
+    app.router.add_post("/_gateway/api/keys/{name}", post_key)
+    app.router.add_post("/_gateway/api/my-key", post_my_key)
+    app.router.add_delete("/_gateway/api/keys/{name}", delete_key)
     app.router.add_route("*", "/{tail:.*}", proxy)  # everything else goes to the API
     app.cleanup_ctx.append(lifespan)
     web.run_app(app, host=HOST, port=PORT, shutdown_timeout=15, access_log=None, print=None)
@@ -496,6 +591,10 @@ def serve(argv):
 def die(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
+
+
+class AdminError(Exception):
+    """A problem to show the admin, on the command line or on the status page."""
 
 
 def clean_token(raw):
@@ -510,30 +609,70 @@ def read_token():
 
 
 def read_admin_json(path):
-    """For CLI edits: refuse to touch a corrupt file instead of replacing its contents."""
+    """For edits: refuse to touch a corrupt file instead of replacing its contents."""
     try:
         return read_json(path, {})
     except ValueError as e:
-        die(str(e))
+        raise AdminError(str(e)) from None
+
+
+@contextmanager
+def editing(path):
+    """Read-modify-write an admin file; nothing is written if the body raises.
+
+    The data directory is locked meanwhile, so an edit from the CLI and one from the
+    status page can't both read the old file and one silently undo the other.
+    """
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = read_admin_json(path)
+        yield data
+        write_json(path, data)
+    finally:
+        os.close(fd)
+
+
+def check_name(name, what):
+    if not NAME_RE.fullmatch(name):
+        raise AdminError(f"{what} names are letters, digits and . _ - @ + % (not only dots, at most 254).")
+
+
+def save_account(label, raw_token):
+    check_name(label, "Account")
+    token = clean_token(raw_token)
+    if not token:
+        raise AdminError("That doesn't look like a Claude Code token (expected sk-ant-oat...).")
+    with editing(ACCOUNTS) as accounts:
+        accounts[label] = token
+    return len(accounts)
+
+
+def new_key(name):
+    name = name.lower()  # developer names are usually Tailscale logins, which ignore case
+    check_name(name, "Developer")
+    with editing(KEYS) as keys:
+        keys[name] = key = "hp-" + secrets.token_urlsafe(24)
+    return key
+
+
+def revoke_key(name):
+    remove(KEYS, name.lower(), "developer key")
 
 
 def remove(path, name, what):
-    entries = read_admin_json(path)
-    if entries.pop(name, None) is None:
-        die(f"No {what} named '{name}'.")
-    write_json(path, entries)
+    with editing(path) as entries:
+        if entries.pop(name, None) is None:
+            raise AdminError(f"No {what} named '{name}'.")
 
 
 def cmd_account(argv):
     sub, args = (argv[0], argv[1:]) if argv else ("list", [])
-    accounts = read_admin_json(ACCOUNTS)
-    if sub == "add" and len(args) == 1 and LABEL_RE.fullmatch(args[0]):
-        token = clean_token(read_token())
-        if not token:
-            die("That doesn't look like a Claude Code token (expected sk-ant-oat...).")
-        accounts[args[0]] = token
-        write_json(ACCOUNTS, accounts)
-        print(f"Saved account '{args[0]}' ({len(accounts)} total).")
+    if sub == "add" and len(args) == 1:
+        check_name(args[0], "Account")  # before asking for the token
+        total = save_account(args[0], read_token())
+        print(f"Saved account '{args[0]}' ({total} total).")
     elif sub == "import":
         entries = []
         for n, line in enumerate(sys.stdin.read().splitlines(), 1):
@@ -542,18 +681,19 @@ def cmd_account(argv):
                 continue
             label, sep, token = line.partition("=")
             label, token = label.strip(), clean_token(token)
-            if not sep or not LABEL_RE.fullmatch(label) or not token:
-                die(f"Line {n} isn't `label=sk-ant-oat...` (nothing was imported).")
+            if not sep or not NAME_RE.fullmatch(label) or not token:
+                raise AdminError(f"Line {n} isn't `label=sk-ant-oat...` (nothing was imported).")
             entries.append((label, token))
         if not entries:
-            die("No accounts found on stdin.")
-        accounts.update(entries)
-        write_json(ACCOUNTS, accounts)
+            raise AdminError("No accounts found on stdin.")
+        with editing(ACCOUNTS) as accounts:
+            accounts.update(entries)
         print(f"Imported {', '.join(l for l, _ in entries)} ({len(accounts)} total).")
     elif sub == "rm" and len(args) == 1:
         remove(ACCOUNTS, args[0], "account")
         print(f"Removed account '{args[0]}'.")
     elif sub == "list":
+        accounts = read_admin_json(ACCOUNTS)
         for label, token in accounts.items():
             print(f"{label:20} {token[:14]}…{token[-4:]}")
         if not accounts:
@@ -564,19 +704,36 @@ def cmd_account(argv):
 
 def cmd_key(argv):
     sub, args = (argv[0], argv[1:]) if argv else ("list", [])
-    keys = read_admin_json(KEYS)
-    if sub == "add" and len(args) == 1 and LABEL_RE.fullmatch(args[0]):
-        keys[args[0]] = "hp-" + secrets.token_urlsafe(24)
-        write_json(KEYS, keys)
-        print(keys[args[0]])
-        print(f"Key for '{args[0]}' (shown once; `key add` again to replace it).", file=sys.stderr)
-    elif sub == "rm" and len(args) == 1:
-        remove(KEYS, args[0], "developer key")
-        print(f"Removed key for '{args[0]}'. Their requests are refused from now on.")
+    name = args[0].lower() if len(args) == 1 else None
+    if sub == "add" and name:
+        print(new_key(name))
+        print(f"Key for '{name}' (shown once; `key add` again to replace it).", file=sys.stderr)
+    elif sub == "rm" and name:
+        revoke_key(name)
+        print(f"Removed the key for '{name}'. Anyone on the tailnet can still make their own key, "
+              "so to keep someone out, remove them from the tailnet.")
     elif sub == "list":
-        print("\n".join(keys) or "No developer keys. Create one with: hotpocket key add NAME")
+        print("\n".join(read_admin_json(KEYS)) or "No developer keys. Create one with: hotpocket key add NAME")
     else:
         die("Usage: hotpocket key add NAME | rm NAME | list")
+
+
+def cmd_admin(argv):
+    sub, args = (argv[0], argv[1:]) if argv else ("list", [])
+    login = args[0].lower() if len(args) == 1 else None
+    if sub == "add" and login:
+        if not NAME_RE.fullmatch(login):
+            raise AdminError("Use the Tailscale login exactly as the status page shows it, e.g. you@example.com.")
+        with editing(ADMINS) as admins:
+            admins[login] = int(time.time())
+        print(f"{login} can now manage accounts and keys at https://<gateway>/_gateway.")
+    elif sub == "rm" and login:
+        remove(ADMINS, login, "admin")
+        print(f"{login} can no longer manage hotpocket from the web.")
+    elif sub == "list":
+        print("\n".join(read_admin_json(ADMINS)) or "No admins. Add one with: hotpocket admin add LOGIN")
+    else:
+        die("Usage: hotpocket admin add LOGIN | rm LOGIN | list")
 
 
 def cmd_status(_argv):
@@ -597,13 +754,17 @@ def cmd_status(_argv):
     for r in rows:
         print("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
     print(f"\n{snap['available']} of {len(snap['accounts'])} accounts ready. "
-          f"Developers: {', '.join(d['name'] for d in snap['developers']) or 'none yet'}")
+          f"Developers: {', '.join(d['name'] + ('' if d['has_key'] else ' (revoked)') for d in snap['developers']) or 'none yet'}")
 
 
 def main():
     argv = sys.argv[1:]
-    commands = {"serve": serve, "account": cmd_account, "key": cmd_key, "status": cmd_status}
+    commands = {"serve": serve, "account": cmd_account, "key": cmd_key, "admin": cmd_admin,
+                "status": cmd_status}
     if not argv or argv[0] not in commands:
         print(__doc__.strip())
         return 0 if argv[:1] in ([], ["-h"], ["--help"]) else 1
-    return commands[argv[0]](argv[1:]) or 0
+    try:
+        return commands[argv[0]](argv[1:]) or 0
+    except AdminError as e:
+        die(str(e))

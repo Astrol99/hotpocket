@@ -30,7 +30,9 @@ from `claude setup-token`. The gateway is a small Python 3.10+ package built on
 
 ## For developers
 
-Add this to `~/.claude/settings.json`, using the key your admin gives you:
+You need to be on the team's Tailscale network. Open
+`https://hotpocket.<your-tailnet>.ts.net/_gateway`, click **Get my key**, and copy
+the snippet it shows into `~/.claude/settings.json` (or ask an admin for a key):
 
 ```json
 {
@@ -41,8 +43,12 @@ Add this to `~/.claude/settings.json`, using the key your admin gives you:
 }
 ```
 
-Then run `claude` as usual. You need to be on Tailscale. To go back to your own
-login, remove those two lines.
+Then run `claude` as usual. To go back to your own login, remove those two lines.
+The key is shown once; if you lose it, click **Replace my key** for a new one (the
+old one stops working).
+
+Use the full `.ts.net` name. The short `https://hotpocket` fails the HTTPS
+certificate check, and Claude Code just keeps retrying instead of showing an error.
 
 While you use the gateway, Claude Code turns off claude.ai connectors (Slack,
 Gmail, etc.), because the gateway's key takes priority over your claude.ai login.
@@ -75,14 +81,28 @@ incus exec hotpocket -- hotpocket account add dev     # paste the token (hidden)
 To add several at once, pipe `label=token` lines into
 `hotpocket account import`.
 
-Developer keys:
+Developer keys: anyone signed in to your tailnet can get their own from the status
+page (**Get my key**). The key is named after their Tailscale login, and they can
+only replace their own. So adding someone to the tailnet is all it takes to give
+them access, and so is sharing the hotpocket machine with someone from another
+tailnet. You can also make and revoke keys yourself (name them after the person's
+Tailscale login, so their own **Get my key** replaces it instead of adding a second):
 
 ```sh
-incus exec hotpocket -- hotpocket key add alice    # prints the key once
-incus exec hotpocket -- hotpocket key rm alice     # revoke
+incus exec hotpocket -- hotpocket key add alice@example.com   # prints the key once
+incus exec hotpocket -- hotpocket key rm alice@example.com    # revoke
 ```
 
-Status: open `https://hotpocket.<your-tailnet>.ts.net/_gateway` in a browser, or:
+Status: open `https://hotpocket.<your-tailnet>.ts.net/_gateway` in a browser.
+For the shorter `http://hotpocket/_gateway`, serve just the status page over plain
+HTTP. The API stays HTTPS-only, so nobody can point Claude Code at plain HTTP by
+mistake.
+
+```sh
+incus exec hotpocket -- tailscale serve --bg --http 80 --set-path /_gateway http://127.0.0.1:8080/_gateway
+```
+
+From the terminal:
 
 ```sh
 incus exec hotpocket -- hotpocket status
@@ -91,6 +111,31 @@ incus exec hotpocket -- journalctl -u hotpocket -f    # request log
 
 Changes to accounts and keys apply immediately, with no restart. Accounts are
 tried in the order you added them when usage is tied.
+
+### Managing from the browser
+
+The status page can also add accounts, replace their tokens, remove them, and
+create or revoke developer keys. First allow your Tailscale login (the page shows
+it in the top corner):
+
+```sh
+incus exec hotpocket -- hotpocket admin add you@example.com
+incus exec hotpocket -- hotpocket admin rm you@example.com     # take it away
+```
+
+Then open `https://hotpocket.<your-tailnet>.ts.net/_gateway`. Everyone else on
+the tailnet can't change anything there except their own key. Some rules:
+
+- Managing only works over HTTPS at the full address, never over the short
+  `http://hotpocket` one.
+- Tokens can be pasted in but are never shown again. A new developer key is
+  shown once, with the `settings.json` snippet to send to the developer.
+- Every change is logged with who made it (`journalctl -u hotpocket`).
+- Your login comes from Tailscale serve on the same machine: hotpocket believes
+  the login header on any connection from 127.0.0.1. So Tailscale serve must be
+  the only thing that forwards connections to it there. Another reverse proxy, a
+  port forward, or an incus proxy device pointed at 127.0.0.1:8080 would let
+  anyone who reaches it claim an admin's login.
 
 ## Development
 

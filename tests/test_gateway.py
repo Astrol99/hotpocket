@@ -23,9 +23,9 @@ def seen():
     except FileNotFoundError: return []
 
 
-def get(path, method="GET"):
+def get(path, method="GET", headers={}, body=None):
     c = http.client.HTTPConnection("127.0.0.1", 18900, timeout=10)
-    c.request(method, path)
+    c.request(method, path, body=body, headers=headers)
     r = c.getresponse()
     return r, r.read()
 
@@ -66,6 +66,8 @@ H = {"authorization": f"Bearer {key}", "anthropic-beta": "claude-code-20250219,i
      "x-claude-code-session-id": "s1", "tailscale-user-login": "alice@example.com", "content-type": "application/json"}
 
 ok(get("/api/hello", "HEAD")[0].status == 200, "keyless HEAD /api/hello connectivity check answered locally")
+ok(get("/favicon.ico")[0].status == 403 and "favicon" not in open(f"{G}/gw.log").read(),
+   "browser probes (favicon) refused without filling the log")
 r, body, *_ = call({"content-type": "application/json"})
 ok(r.status == 403 and b"developer key" in body, "no key -> 403")
 r, body, *_ = call(dict(H, authorization="Bearer hp-wrong"))
@@ -91,10 +93,99 @@ snap, acc = status()
 ok(acc["limited"]["blocked_kind"] == "limit" and acc["limited"]["blocked_until"] > time.time() + 7000, "limited blocked until its reset header")
 ok(acc["good"]["five_hour"] == 0.42 and acc["good"]["requests"] == 3, f"usage tracked from headers ({acc['good']['five_hour']}, {acc['good']['requests']} req)")
 ok(snap["developers"][0]["name"] == "alice" and snap["developers"][0]["requests"] == 3, "per-developer counts")
-page = get("/_gateway")[1].decode()
-ok("<table>" in page and "alice" in page and "usage limit reached" in page, "HTML status page")
+r, page = get("/_gateway")
+ok(b"<title>hotpocket</title>" in page and "frame-ancestors 'none'" in r.getheader("content-security-policy", ""),
+   "status page served, can't be framed")
 rc, out = cli("status"); print("    " + out.replace("\n", "\n    "))
 ok(rc == 0 and "usage limit reached" in out, "CLI status")
+
+# --- managing from the status page (Tailscale serve supplies the identity headers)
+ADM = {"tailscale-user-login": "Admin@Example.com", "x-forwarded-proto": "https",
+       "origin": "https://127.0.0.1:18900", "content-type": "application/json"}
+
+
+def with_key(key, session):  # a developer's request headers
+    return dict(H, authorization=f"Bearer {key}", **{"x-claude-code-session-id": session})
+
+
+def manage(method, path, body=None, headers={}):  # headers override ADM; None drops one
+    h = {k: v for k, v in {**ADM, **headers}.items() if v is not None}
+    r, data = get("/_gateway/api/" + path, method, h, None if body is None else json.dumps(body))
+    return r.status, json.loads(data or b"{}")
+
+
+st, _ = manage("PUT", "accounts/web", {"token": "sk-ant-oat01-WEB"})
+ok(st == 403, f"web management refused until an admin is added ({st})")
+rc, out = cli("admin", "add", "admin@example.com")
+ok(rc == 0 and "admin@example.com" in cli("admin", "list")[1], "admin add/list")
+v = json.loads(get("/_gateway/status", headers=ADM)[1])["viewer"]
+ok(v == {"login": "admin@example.com", "https": True, "member": True, "admin": True}, f"admin recognized: {v}")
+ok([manage("PUT", "accounts/web", {"token": "sk-ant-oat01-WEB"}, hd)[0] for hd in (
+    {"x-forwarded-proto": None}, {"origin": "https://evil.example"}, {"origin": None},
+    {"tailscale-user-login": "bob@example.com"})] == [403] * 4,
+   "refused over plain HTTP, from another site, without an origin, or for a non-admin")
+st, res = manage("PUT", "accounts/web", {"token": "not-a-token"})
+ok(st == 400 and "sk-ant-oat" in res["error"], f"bad token rejected: {res}")
+st, res = manage("PUT", "accounts/bad%20label", {"token": "sk-ant-oat01-WEB"})
+ok(st == 400 and "names are" in res["error"], f"bad label rejected: {res}")
+st, res = manage("PUT", "accounts/web", {"token": " sk-ant-oat01-WEB\n"})
+_, acc = status()
+ok(st == 200 and res == {"accounts": 3} and "web" in acc, f"account added from the web ({st} {res})")
+ok(b"sk-ant" not in get("/_gateway/status")[1], "status never shows any part of a token")
+st, res = manage("POST", "keys/bob")
+bob = with_key(res.get("key"), "bob")
+ok(st == 200 and res["key"].startswith("hp-") and call(bob)[0].status == 200, "key created from the web works")
+st, _ = manage("DELETE", "keys/bob")
+ok(st == 200 and call(bob)[0].status == 403, "key revoked from the web is refused")
+# anyone signed in to Tailscale can get (and replace) their own key, and only their own
+AS_BOB = {"tailscale-user-login": "Bob@Example.com"}
+ok([manage("POST", "my-key", headers=dict(AS_BOB, **hd))[0] for hd in (
+    {"x-forwarded-proto": None}, {"tailscale-user-login": None}, {"origin": "https://evil.example"})] == [403] * 3,
+   "own key refused over plain HTTP, without a Tailscale login, or from another site")
+st, mine = manage("POST", "my-key", headers=AS_BOB)
+ok(st == 200 and mine["name"] == "bob@example.com" and call(with_key(mine["key"], "own"))[0].status == 200,
+   f"signed-in developer gets a working key named after their login ({st} {mine.get('name')})")
+st, again = manage("POST", "my-key", headers=AS_BOB)
+ok(st == 200 and call(with_key(mine["key"], "own"))[0].status == 403 and call(with_key(again["key"], "own"))[0].status == 200,
+   "replacing your own key stops the old one")
+manage("DELETE", "keys/BOB@example.com")  # names ignore case, like Tailscale logins
+ok("bob@example.com" not in cli("key", "list")[1], "admin revokes a self-made key, whatever the case")
+devs = {d["name"]: d for d in status()[0]["developers"]}
+ok(devs["bob"]["has_key"] is False and devs["bob"]["requests"] == 1 and devs["alice"]["has_key"],
+   "developers list shows revoked keys with their history")
+ok(manage("POST", "my-key", headers={"tailscale-user-login": "o'brien@example.com"})[0] == 400,
+   "a login that can't name a key gets a clear refusal")
+st, _ = manage("DELETE", "accounts/web")
+st2, res = manage("DELETE", "accounts/web")
+ok(st == 200 and "web" not in status()[1] and st2 == 400 and "No account" in res["error"], "account removed from the web")
+log_text = open(f"{G}/gw.log").read()
+ok("admin admin@example.com: saved account web" in log_text and "admin admin@example.com: removed the key for bob" in log_text
+   and "bob@example.com: created their own key" in log_text, "admin and self-service actions logged")
+os.environ["HOTPOCKET_DATA"] = env["HOTPOCKET_DATA"]
+import hotpocket
+ok(hotpocket.viewer("127.0.0.1", ADM)["admin"] and not hotpocket.viewer("100.64.0.9", ADM)["admin"],
+   "identity headers believed only from this host (where Tailscale serve runs)")
+ok(hotpocket.used({"five_hour": .9, "five_hour_reset": time.time() - 1}, "five_hour", time.time()) == 0
+   and hotpocket.used({}, "five_hour", time.time()) is None, "a window past its reset reads 0%; no data stays unknown")
+forged = "/_gateway/api/keys/x%0A2026-01-01%2000:00:00%20admin%20evil:%20removed%20the%20key%20for%20bob"
+ok(get(forged, "POST")[0].status == 403 and not any(l.startswith("2026-01-01") for l in open(f"{G}/gw.log")),
+   "a request path can't forge lines in the audit log")
+admins = Path(f"{G}/data/admins.json"); good_admins = admins.read_text()
+admins.write_text(good_admins.rstrip().rstrip("}") + ",}")  # a broken hand edit
+ok(manage("POST", "keys/carol")[0] == 403, "a corrupt admins file grants no one access")
+admins.write_text('"admin@example.com"')  # valid JSON, wrong shape
+ok(manage("POST", "keys/carol", headers={"tailscale-user-login": "min@example.com"})[0] == 403,
+   "an admins file that isn't a JSON object grants no one access (no substring matches)")
+admins.write_text(good_admins)
+keys_file = Path(f"{G}/data/keys.json"); good_keys = keys_file.read_text()
+keys_file.write_text('["oops"]')  # wrong shape: the server keeps the last good keys instead of crashing
+ok(call(H)[0].status == 200 and cli("key", "add", "zed")[0] != 0, "a keys file that isn't a JSON object is refused, not crashed on")
+keys_file.write_text(good_keys)
+r, body = get("/_gateway/api/keys/carol", "POST", ADM)
+ok(r.status == 200 and r.getheader("cache-control") == "no-store", "a new key's response is never cached")
+manage("DELETE", "keys/carol")
+ok(cli("key", "add", "..")[0] != 0 and manage("PUT", "accounts/.", {"token": "sk-ant-oat01-X"})[0] in (400, 403, 404),
+   "dot-only names refused (they break URLs)")
 
 # live account edits: drop 'good' -> only the limited one is left -> synthesized 429
 cli("account", "rm", "good")
@@ -162,9 +253,15 @@ open(f"{G}/data/accounts.json", "w").write(good_accounts.rstrip().rstrip("}") + 
 rc, out = cli("account", "add", "new", stdin="sk-ant-oat01-NEW\n")
 ok(rc != 0 and "not valid JSON" in out and open(f"{G}/data/accounts.json").read().endswith(",}"),
    "CLI refuses to overwrite a corrupt accounts file")
+st, res = manage("PUT", "accounts/new", {"token": "sk-ant-oat01-NEW"})
+ok(st == 400 and "not valid JSON" in res["error"] and open(f"{G}/data/accounts.json").read().endswith(",}"),
+   "web page refuses to overwrite a corrupt accounts file")
 ok(get("/_gateway/health")[0].status == 200 and status()[1].get("slow") is not None,
    "server keeps the last good accounts while the file is corrupt")
 open(f"{G}/data/accounts.json", "w").write(good_accounts)
+
+cli("admin", "rm", "admin@example.com")
+ok(manage("DELETE", "keys/alice")[0] == 403, "removed admin can no longer manage")
 
 gw.terminate(); gw.wait(5)
 st = json.load(open(f"{G}/data/state.json"))

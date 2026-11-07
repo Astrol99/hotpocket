@@ -47,5 +47,7 @@ Next: join the container to Tailscale (one time).
   ${PREFIX}incus exec $NAME -- tailscale up --hostname=$NAME
 Open the link it prints and approve the machine, then serve the gateway over HTTPS:
   ${PREFIX}incus exec $NAME -- tailscale serve --bg 8080
+Optional: a short http://$NAME/_gateway address for the status page only:
+  ${PREFIX}incus exec $NAME -- tailscale serve --bg --http 80 --set-path /_gateway http://127.0.0.1:8080/_gateway
 EOF
 fi
