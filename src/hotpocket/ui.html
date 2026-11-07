@@ -37,7 +37,7 @@ tbody th{font-weight:600}
 .actions{text-align:right}
 .more{padding:1px 9px;font-size:16px;line-height:1.3;border-color:transparent}
 .more:hover{background:var(--panel)}
-.icon{width:12px;height:12px;margin-right:6px;vertical-align:-1px;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
+.icon{width:12px;height:12px;margin-right:6px;vertical-align:-1px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 .menu{padding:4px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);box-shadow:0 8px 24px rgb(0 0 0/.18);text-align:left}
 .menu button{display:block;width:100%;text-align:left;border:0;background:none;padding:7px 12px}
 .menu button:hover{background:var(--panel)}
@@ -130,7 +130,8 @@ let snap = null;
 
 // Builds elements from text only (never HTML), so names can't inject markup.
 function h(tag, attrs = {}, ...kids) {
-  const e = document.createElement(tag);
+  const e = ['svg', 'path'].includes(tag) ? document.createElementNS('http://www.w3.org/2000/svg', tag)
+                                          : document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
     if (k.startsWith('on')) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v);
   }
@@ -247,6 +248,11 @@ function usageAge(a) {
            a.usage_at ? 'usage as of ' + ago(a.usage_at) : 'usage from earlier');
 }
 
+// Line icons, 12x12, in the text's color.
+const ICONS = {key: 'M1.5 8a2.5 2.5 0 1 0 5 0a2.5 2.5 0 1 0-5 0M5.8 6.2l4.7-4.7M8.8 3.2l1.5 1.5',
+               trash: 'M1.5 3h9M4.5 3V1.5h3V3M2.7 3l.6 7.5h5.4l.6-7.5'};
+const icon = name => h('svg', {class: 'icon', viewBox: '0 0 12 12', 'aria-hidden': 'true'}, h('path', {d: ICONS[name]}));
+
 // A row's actions sit behind a "⋯" button, in a native popover: it closes on Esc or a click elsewhere.
 let menus = 0;
 function menu(name, ...items) {
@@ -262,8 +268,8 @@ function accountRow(a) {
     h('th', {scope: 'row'}, a.label, usageAge(a)), stateCell(a), meterCell(a, 'five_hour', '5-hour'), meterCell(a, 'seven_day', 'Weekly'),
     usageCell(a),
     h('td', {class: 'actions admin-only'}, menu(a.label,
-      h('button', {onclick: () => replaceToken(a.label)}, 'New token'),
-      h('button', {class: 'bad', onclick: e => removeAccount(e.target, a.label)}, 'Remove'))));
+      h('button', {onclick: () => replaceToken(a.label)}, icon('key'), 'New token'),
+      h('button', {class: 'bad', onclick: e => removeAccount(e.target, a.label)}, icon('trash'), 'Remove'))));
 }
 
 function devRow(d) {
@@ -274,9 +280,9 @@ function devRow(d) {
     h('td', {'data-label': 'Last account'}, d.last_account || '–'),
     // Your own row has "New key" (to set up again or replace a lost key); admins can do it for anyone.
     h('td', {class: 'actions'}, menu(d.name,
-      d.name === snap.viewer.login ? h('button', {onclick: e => newMyKey(e.target)}, 'New key')
-        : snap.viewer.admin ? h('button', {onclick: e => makeKey(e.target, d.name, true)}, 'New key') : null,
-      snap.viewer.admin ? h('button', {class: 'bad', onclick: e => removeDev(e.target, d.name)}, 'Remove') : null)));
+      d.name === snap.viewer.login ? h('button', {onclick: e => newMyKey(e.target)}, icon('key'), 'New key')
+        : snap.viewer.admin ? h('button', {onclick: e => makeKey(e.target, d.name, true)}, icon('key'), 'New key') : null,
+      snap.viewer.admin ? h('button', {class: 'bad', onclick: e => removeDev(e.target, d.name)}, icon('trash'), 'Remove') : null)));
 }
 
 function accessNote(v) {
