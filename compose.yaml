@@ -30,10 +30,12 @@ services:
     restart: unless-stopped
 
 configs:
-  serve:  # HTTPS for everything; plain HTTP (http://hotpocket) only redirects to it
+  # HTTPS for everything; plain HTTP (http://hotpocket) only redirects to it. Compose doesn't notice an
+  # edit here: apply one with `docker compose up -d --force-recreate` (both services, as they share a network).
+  serve:
     content: |
       {"TCP": {"443": {"HTTPS": true}, "80": {"HTTP": true}},
        "Web": {"$${TS_CERT_DOMAIN}:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8080"}}},
-               "$${TS_CERT_DOMAIN}:80": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8080/_gateway/https/$${TS_CERT_DOMAIN}"}}}}}
+               "$${TS_CERT_DOMAIN}:80": {"Handlers": {"/": {"Redirect": "https://$${TS_CERT_DOMAIN}/"}}}}}
 
 volumes: {tailscale: {}, data: {}}

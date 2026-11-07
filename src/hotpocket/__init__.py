@@ -1,13 +1,12 @@
 """hotpocket: one Claude Code endpoint for the team, backed by a pool of Claude accounts.
 
-Make yourself an admin (`hotpocket admin add you@example.com`, your Tailscale
-login), then manage accounts and keys on the status page, https://<gateway>.
-Developers get their key there too and point Claude Code at the gateway:
-  ANTHROPIC_BASE_URL=https://<gateway>  ANTHROPIC_AUTH_TOKEN=<their key>
+Make yourself an admin (`hotpocket admin add LOGIN`, your Tailscale login); everything else,
+developers' keys included, is on the status page at https://<gateway>.
 """
 
 import argparse
 import asyncio
+import datetime
 import functools
 import hashlib
 import json
@@ -60,15 +59,7 @@ def log(msg):
 
 
 def until_text(ts):
-    if not ts:
-        return "-"
-    secs = int(ts - time.time())
-    if secs <= 0:
-        return "now"
-    if secs < 60:
-        return f"{secs}s"
-    h, m = divmod((secs + 59) // 60, 60)
-    return f"{h // 24}d{h % 24}h" if h >= 24 else f"{h}h{m:02d}m" if h else f"{m}m"
+    return str(datetime.timedelta(seconds=max(0, round(ts - time.time()))))  # 1:59:59, or 1 day, 2:00:00
 
 
 def num(headers, name):
@@ -178,11 +169,9 @@ class Pool:
         return self.accounts.setdefault(label, {"requests": 0})
 
     def blocked(self, label, token, now):
-        # A block belongs to the token that earned it, so replacing a token clears it. A kind no longer
-        # in REASONS (an old "throttle" block from saved state) doesn't count.
+        # A block belongs to the token that earned it, so replacing a token clears it.
         a = self.accounts.get(label, {})
-        return (a.get("blocked_until", 0) > now and a.get("blocked_token") == key_hash(token)[:16]
-                and a.get("blocked_kind") in REASONS)
+        return a.get("blocked_until", 0) > now and a.get("blocked_token") == key_hash(token)[:16]
 
     def _util(self, label):
         a, now = self.accounts.get(label, {}), time.time()
@@ -242,7 +231,7 @@ class Pool:
             rows.append({
                 "label": label, "available": not blocked,
                 "blocked_kind": a["blocked_kind"] if blocked else None,
-                "blocked_reason": REASONS.get(a["blocked_kind"]) if blocked else None,
+                "blocked_reason": REASONS[a["blocked_kind"]] if blocked else None,
                 "blocked_until": a["blocked_until"] if blocked else None,
                 **{w: used(a, w, now) for w in WINDOWS}, **{w + "_reset": a.get(w + "_reset") for w in WINDOWS},
                 "usage_at": a.get("usage_at"), "requests": a.get("requests", 0),
@@ -259,9 +248,13 @@ class Pool:
         return {"accounts": rows, "developers": devs, "since": self.since}
 
     def tick(self):
-        """Every few seconds: forget idle sessions and save state if it changed."""
+        """Every few seconds: forget idle sessions and removed accounts and developers, and save if anything changed."""
         cutoff = time.time() - SESSION_TTL
         self.sessions = {s: v for s, v in self.sessions.items() if v[1] > cutoff}
+        for kept, current in ((self.accounts, load_accounts()), (self.devs, key_names())):
+            for gone in kept.keys() - set(current):
+                del kept[gone]
+                self.dirty = True
         if self.dirty:
             write("INSERT OR REPLACE INTO state VALUES ('pool', ?)",
                   json.dumps({"accounts": self.accounts, "devs": self.devs, "since": self.since}))
@@ -494,15 +487,6 @@ async def to_status_page(_request):
     raise web.HTTPFound("/_gateway/")  # where the page's relative links resolve
 
 
-@routes.route("*", "/_gateway/https/{domain:[^/]+}{rest:.*}")  # any method: API calls too
-async def to_https(request):
-    # Plain HTTP (http://hotpocket) lands here, with Tailscale serve filling in its own HTTPS
-    # name. Only plain HTTP is redirected, so this can't send anyone to another site.
-    if request.headers.get("x-forwarded-proto") == "https":
-        raise web.HTTPNotFound()
-    raise web.HTTPFound(f"https://{request.match_info['domain']}/")
-
-
 @routes.get("/_gateway/")
 async def status_page(_request):
     return web.FileResponse(Path(__file__).with_name("ui.html"),
@@ -515,10 +499,8 @@ async def hello(_request):
     return web.json_response({"message": "hello"})
 
 
-ROLES = {  # role -> (why it's refused, for the log; what the page shows)
-    "admin": ("not an admin", "Only hotpocket admins can do this, over HTTPS."),
-    "member": ("not signed in to Tailscale over HTTPS", "Open this page at its https://….ts.net address on Tailscale."),
-}
+ROLES = {"admin": "Only hotpocket admins can do this, over HTTPS.",  # why a viewer without the role is refused
+         "member": "Open this page at its https://….ts.net address on Tailscale."}
 
 
 def page_api(role):
@@ -529,19 +511,19 @@ def page_api(role):
             origin = request.headers.get("origin")
             why = None
             if not who[role]:
-                why = ROLES[role][0]
+                why = ROLES[role]
             elif origin != f"https://{request.host}":  # stops other sites making a signed-in browser call this
                 why = f"request came from {origin or 'no page'}, not the status page"
             if why:
                 log(f"refused {request.method} {request.rel_url.raw_path} from {who['login'] or request.remote}: {why}")
-                return web.json_response({"error": ROLES[role][1]}, status=403)
+                return api_error(403, "permission_error", ROLES[role])
             try:
                 done, result = await handler(request, **request.match_info)
             except AdminError as e:
-                return web.json_response({"error": str(e)}, status=400)
+                return api_error(400, "invalid_request_error", str(e))
             except sqlite3.OperationalError as e:  # e.g. locked by a long write elsewhere
                 log(f"refused {request.method} {request.rel_url.raw_path}: database error ({e})")
-                return web.json_response({"error": "The database is busy; try again in a moment."}, status=503)
+                return api_error(503, "overloaded_error", "The database is busy; try again in a moment.")
             log(f"{'admin ' if role == 'admin' else ''}{who['login']}: {done}")
             POOL.touch()  # other open status pages show the change right away
             return web.json_response(result, headers={"cache-control": "no-store"})  # may hold a new key
@@ -556,8 +538,8 @@ async def put_account(request, name):
         token = str((await request.json())["token"])
     except (ValueError, KeyError, TypeError):
         raise AdminError('Expected a JSON body with "token".') from None
-    total = save_account(name, token)
-    return f"saved account {name}", {"accounts": total}
+    save_account(name, token)
+    return f"saved account {name}", {}
 
 
 @routes.delete("/_gateway/api/accounts/{name}")
@@ -578,8 +560,7 @@ async def post_key(_request, name):
 @page_api("admin")
 async def delete_key(_request, name):
     name = name.lower()
-    remove("keys", "name", name, "developer key")
-    POOL.devs.pop(name, None)  # their history goes with them (saved, as every edit touches the pool)
+    remove("keys", "name", name, "developer key")  # their history goes at the next tick
     return f"removed developer {name}", {}
 
 
@@ -588,8 +569,6 @@ async def delete_key(_request, name):
 async def post_my_key(request):
     # Anyone on the tailnet can get (or replace) the key named after their own login, and only that one.
     login = viewer(request.remote, request.headers)["login"]
-    if not NAME_RE.fullmatch(login):
-        raise AdminError(f"Your Tailscale login ({login}) can't name a key here; ask a hotpocket admin for one.")
     return "created their own key", {"name": login, "key": new_key(login)}
 
 
@@ -648,15 +627,13 @@ def check_name(name, what):
 
 
 def save_account(label, raw_token):
-    """Add an account or replace its token (a replaced account keeps its place); returns the count."""
+    """Add an account or replace its token (a replaced account keeps its place)."""
     check_name(label, "Account")
     token = "".join(raw_token.split())
     if not TOKEN_RE.fullmatch(token):
         raise AdminError("That doesn't look like a Claude Code token (expected sk-ant-oat...).")
-    with db() as con:
-        con.execute("INSERT INTO accounts VALUES (?, ?, (SELECT IFNULL(MAX(position), 0) + 1 FROM accounts)) "
-                    "ON CONFLICT (label) DO UPDATE SET token = excluded.token", (label, token))
-        return con.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+    write("INSERT INTO accounts VALUES (?, ?, (SELECT IFNULL(MAX(position), 0) + 1 FROM accounts)) "
+          "ON CONFLICT (label) DO UPDATE SET token = excluded.token", label, token)
 
 
 def new_key(name):

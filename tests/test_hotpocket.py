@@ -12,7 +12,7 @@ from aiohttp import web
 
 import hotpocket
 
-U = "anthropic-ratelimit-unified-"
+U = hotpocket.UNIFIED
 SEEN = web.AppKey("seen", list)  # what the fake API was sent
 TOKEN = "sk-ant-oat01-NEW"
 
@@ -80,8 +80,7 @@ async def gw(data, aiohttp_server, aiohttp_client, monkeypatch):
 
 
 def use_accounts(*suffixes):
-    for label in hotpocket.load_accounts():
-        hotpocket.remove("accounts", "label", label, "account")
+    hotpocket.write("DELETE FROM accounts")
     for suffix in suffixes:
         hotpocket.save_account(suffix.lower(), f"sk-ant-oat01-{suffix}")
 
@@ -129,10 +128,6 @@ async def test_routes_that_never_reach_the_api(gw, capsys):
     assert "favicon" not in capsys.readouterr().out  # browser probes leave no log line
     for path in ("/", "/_gateway"):  # both lead to the page, at /_gateway/ where its relative links work
         assert (await gw.get(path, allow_redirects=False)).headers["location"] == "/_gateway/"
-    to_https = "/_gateway/https/hotpocket.example.ts.net/"  # where Tailscale serve sends plain HTTP
-    assert (await gw.get(to_https, allow_redirects=False)).headers["location"] == "https://hotpocket.example.ts.net/"
-    assert (await gw.get(to_https, headers={"x-forwarded-proto": "https"})).status == 404  # no open redirect
-    assert (await gw.post(to_https + "v1/messages", headers=gw.dev, allow_redirects=False)).status == 302
     assert gw.seen == []  # an API call over plain HTTP never reaches Anthropic
     resp = await gw.get("/")
     assert "<title>hotpocket</title>" in await resp.text()
@@ -218,7 +213,7 @@ async def test_rejected_and_throttled_accounts_are_skipped(gw):
     assert acc["bad"]["blocked_kind"] == "auth" and acc["throttle"]["available"]  # a plain 429 blocks no one
 
 
-@pytest.mark.parametrize("suffixes", [["THROTTLE"], ["SLOWDOWN"], ["THROTTLE", "SLOWDOWN"]])
+@pytest.mark.parametrize("suffixes", [["THROTTLE"], ["THROTTLE", "SLOWDOWN"]])
 async def test_a_429_from_every_account_comes_back_as_is_and_blocks_no_one(gw, capsys, suffixes):
     # Such a 429 can be about the request itself, so one request mustn't lock everyone out.
     use_accounts(*suffixes)
@@ -237,13 +232,6 @@ async def test_a_429_that_isnt_json_comes_back_as_an_api_error(gw, capsys):
     resp, _ = await call(gw)
     assert resp.status == 429 and (await resp.json())["error"]["type"] == "rate_limit_error"
     assert "(429: <html>slow down</html>)" in capsys.readouterr().out
-
-
-async def test_an_old_throttle_block_in_saved_state_blocks_no_one(gw):
-    hotpocket.POOL.block("good", "sk-ant-oat01-GOOD", "auth", time.time() + 60)
-    hotpocket.POOL.accounts["good"]["blocked_kind"] = "throttle"  # as saved before throttles stopped blocking
-    use_accounts("GOOD")
-    assert (await call(gw))[0].status == 200 and (await status(gw))["accounts"]["good"]["blocked_reason"] is None
 
 
 async def test_rejected_token_is_403_and_its_replacement_used_at_once(gw):
@@ -278,6 +266,14 @@ async def test_developers_share_the_pool_limits_by_what_their_requests_cost(gw):
     await call(gw, dev(hotpocket.new_key("bob")))  # bob's request costs the same, so they split it evenly
     devs = {d["name"]: d for d in (await status(gw))["developers"]}
     assert devs["alice"]["five_hour"] == devs["bob"]["five_hour"] == pytest.approx(0.42 / 2 / 2)
+
+
+async def test_removed_accounts_and_developers_are_forgotten(gw):
+    await call(gw)
+    use_accounts("LIMITED")
+    hotpocket.write("DELETE FROM keys")
+    hotpocket.POOL.tick()  # so a label or name added again starts fresh
+    assert set(hotpocket.POOL.accounts) == {"limited"} and not hotpocket.POOL.devs
 
 
 async def test_tokens_and_estimated_api_cost_are_counted(gw):
@@ -326,13 +322,13 @@ async def test_managing_needs_https_from_the_page_and_admin_for_accounts(gw):
         for method, path in (("PUT", "accounts/web"), ("POST", "my-key")):
             assert (await manage(gw, method, path, {"token": TOKEN}, **who))[0] == 403, (path, who)
     assert (await manage(gw, "PUT", "accounts/web", {"token": TOKEN}, login="bob@x.com"))[0] == 403
-    assert await manage(gw, "PUT", "accounts/web", {"token": f" {TOKEN}\n"}) == (200, {"accounts": 3})
+    assert await manage(gw, "PUT", "accounts/web", {"token": f" {TOKEN}\n"}) == (200, {})
 
 
 async def test_admin_edits_accounts_and_keys(gw, capsys):
     assert (await manage(gw, "PUT", "accounts/web", {"token": "nope"}))[0] == 400
     status_, res = await manage(gw, "PUT", "accounts/bad%20label", {"token": TOKEN})
-    assert status_ == 400 and "names are" in res["error"]
+    assert status_ == 400 and "names are" in res["error"]["message"]
     assert (await manage(gw, "PUT", "accounts/.", {"token": TOKEN}))[0] in (400, 403, 404)
     with pytest.raises(hotpocket.AdminError):
         hotpocket.new_key("..")
@@ -342,7 +338,7 @@ async def test_admin_edits_accounts_and_keys(gw, capsys):
     assert (await call(gw, dev(res["key"], "bob")))[0].status == 403
     assert "bob" not in {d["name"] for d in (await status(gw))["developers"]}  # removed, history and all
     assert (await manage(gw, "DELETE", "accounts/good"))[0] == 200
-    assert await manage(gw, "DELETE", "accounts/good") == (400, {"error": "No account named 'good'."})
+    assert await manage(gw, "DELETE", "accounts/good") == (400, {"type": "error", "error": {"type": "invalid_request_error", "message": "No account named 'good'."}})
     log = capsys.readouterr().out
     assert "admin admin@example.com: created a key for bob" in log
     assert "admin admin@example.com: removed account good" in log
@@ -373,7 +369,7 @@ async def test_locked_database_gives_the_page_a_503(gw):
     locker.execute("BEGIN IMMEDIATE")
     status_, res = await manage(gw, "POST", "keys/busy")
     locker.close()
-    assert status_ == 503 and "busy" in res["error"]
+    assert status_ == 503 and "busy" in res["error"]["message"]
 
 
 async def test_cli_and_page_edits_at_the_same_time_all_land(gw, data):

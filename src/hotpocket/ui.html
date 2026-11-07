@@ -82,7 +82,7 @@ body:not(.is-admin) .admin-only{display:none!important}
 <svg hidden><symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol><symbol id="i-key-round" viewBox="0 0 24 24"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/></symbol><symbol id="i-trash-2" viewBox="0 0 24 24"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol><symbol id="i-ellipsis" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol></svg>
 <header><h1>hotpocket</h1><span id="who"></span></header>
 <p id="offline" class="note bad" hidden>Can't reach the gateway. Retrying…</p>
-<p id="access" class="note" hidden></p>
+<p id="access" class="note" hidden>Read-only: open this page on Tailscale, at its https://….ts.net address, to get your key.</p>
 <div id="tiles" class="tiles"></div>
 
 <section>
@@ -158,7 +158,6 @@ const ago = ts => !ts ? 'never' : now() - ts < 60 ? 'just now' : span(now() - ts
 const clock = ts => ts ? new Date(ts * 1000).toLocaleString([], {weekday: 'short', hour: 'numeric', minute: '2-digit'}) : '';
 const pct = v => Math.round(v * 100) + '%';
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-const left = v => pct(Math.max(0, 1 - v)) + ' left';
 const count = n => n.toLocaleString('en', {notation: 'compact', maximumFractionDigits: 1});
 const money = v => v.toLocaleString('en', {style: 'currency', currency: 'USD', notation: 'compact',
                                          minimumFractionDigits: 2, maximumFractionDigits: 2});
@@ -189,8 +188,7 @@ async function api(method, path, body) {
     method, headers: {'content-type': 'application/json'},
     body: body === undefined ? undefined : JSON.stringify(body)});
   const data = await r.json().catch(() => ({}));
-  // Admin endpoints answer {error: "..."}; anything else (the API's shape) has {error: {message}}.
-  if (!r.ok) throw new Error(data.error?.message || data.error || `Request failed (HTTP ${r.status}).`);
+  if (!r.ok) throw new Error(data.error?.message || `Request failed (HTTP ${r.status}).`);
   return data;
 }
 
@@ -235,7 +233,7 @@ function poolUse(w, label) {
   const parts = snap.accounts.map((a, i) => ({v: Math.min(1, a[w] || 0) / snap.accounts.length, color: color(i),
     label: a.label, name: `${a.label}: ${pct(Math.min(1, a[w] || 0))} of its limit used`}));
   const use = sum(parts.map(p => p.v));
-  return tile(label, pct(use), left(use) + ' of usage limit total', parts);
+  return tile(label, pct(use), pct(Math.max(0, 1 - use)) + ' left of usage limit total', parts);
 }
 
 // The same, split by developer: each one's estimated share of the pool's limit (see Pool.snapshot).
@@ -256,7 +254,7 @@ function meterCell(a, w, label) {
 
 function stateCell(a) {
   if (a.available) return h('td', {'data-label': 'State'}, h('span', {class: 'ok'}, '● Ready'));
-  const why = a.blocked_reason || 'unavailable', reason = why[0].toUpperCase() + why.slice(1);
+  const reason = a.blocked_reason[0].toUpperCase() + a.blocked_reason.slice(1);
   const next = a.blocked_kind === 'auth' ? 'replace its token' : 'back ' + until(a.blocked_until);
   return h('td', {'data-label': 'State'}, h('span', {class: 'bad'}, '● ' + reason),
            h('div', {class: 'sub', title: clock(a.blocked_until)}, next));
@@ -311,26 +309,16 @@ function devRow(d) {
       snap.viewer.admin ? h('button', {class: 'bad', onclick: e => removeDev(e.currentTarget, d.name)}, icon('trash-2'), 'Remove') : null)));
 }
 
-function accessNote(v) {
-  return v.member ? '' : 'Read-only: open this page on Tailscale, at its https://….ts.net address, to get your key.';
-}
-
 // The developer (each one has a key) under this name, if any.
 const keyOf = name => snap.developers.find(d => d.name === name);
-
-// "Get my key" for anyone signed in who has none yet; once they do, their row has "New key".
-function renderMine(v) {
-  $('#mine-button').hidden = !v.member || Boolean(keyOf(v.login));
-}
 
 function render() {
   const {accounts, developers, viewer} = snap;
   document.body.classList.toggle('is-admin', viewer.admin);
   $('#who').textContent = viewer.login ? viewer.login + (viewer.admin ? ' · admin' : '') : '';
-  const note = accessNote(viewer);
-  $('#access').textContent = note;
-  $('#access').hidden = !note;
-  renderMine(viewer);
+  $('#access').hidden = viewer.member;
+  // "Get my key" for anyone signed in who has none yet; once they do, their row has "New key".
+  $('#mine-button').hidden = !viewer.member || Boolean(keyOf(viewer.login));
 
   const cost = sum(accounts.map(a => a.cost || 0)), all = sum(accounts.map(a => tokens(a.tokens)));
   $('#tiles').replaceChildren(poolUse('five_hour', '5-hour'), poolUse('seven_day', 'Weekly'),
