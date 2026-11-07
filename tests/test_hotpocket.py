@@ -118,7 +118,9 @@ async def test_routes_that_never_reach_the_api(gw, capsys):
     assert (await gw.head("/api/hello")).status == 200  # Claude Code's keyless connectivity check
     assert (await gw.get("/favicon.ico")).status == 403
     assert "favicon" not in capsys.readouterr().out  # browser probes leave no log line
-    resp = await gw.get("/_gateway")
+    for path in ("/", "/_gateway"):  # both lead to the page, at /_gateway/ where its relative links work
+        assert (await gw.get(path, allow_redirects=False)).headers["location"] == "/_gateway/"
+    resp = await gw.get("/")
     assert "<title>hotpocket</title>" in await resp.text()
     assert "frame-ancestors 'none'" in resp.headers["content-security-policy"]
     assert resp.headers["content-type"] == "text/html; charset=utf-8"

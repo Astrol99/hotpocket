@@ -22,7 +22,7 @@ over Tailscale, at `https://hotpocket.<your-tailnet>.ts.net`.
 ## For developers
 
 You need to be on the team's Tailscale network. Open
-`https://hotpocket.<your-tailnet>.ts.net/_gateway`, click **Get my key**, and paste
+`https://hotpocket.<your-tailnet>.ts.net`, click **Get my key**, and paste
 the snippet it shows into `~/.claude/settings.json`. Then run `claude` as usual;
 remove the snippet to go back to your own login.
 
@@ -48,7 +48,7 @@ Without a key, open the newest link from `docker compose logs -f tailscale`; the
 link changes every minute until it's used. Then, in the Tailscale admin console,
 turn off key expiry for the `hotpocket` machine.
 
-Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts.net/_gateway`:
+Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts.net`:
 
 - **Accounts:** paste a token from `claude setup-token` for each Claude account.
   Saving under an existing label replaces its token, for example a rejected one.
@@ -59,7 +59,7 @@ Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts
   An update recreates the container and starts a new log, so save it first if you
   need the history.
 
-Managing works only at the full HTTPS address; `http://hotpocket/_gateway` is a
+Managing works only at the full HTTPS address; `http://hotpocket` is a
 read-only view. hotpocket learns who you are from Tailscale serve, which reaches it
 on 127.0.0.1 in the Tailscale container's network, so never publish its port or
 put another proxy in front of it. `hotpocket admin --help` lists the admin commands.

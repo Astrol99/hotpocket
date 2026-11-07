@@ -1,7 +1,7 @@
 """hotpocket: one Claude Code endpoint for the team, backed by a pool of Claude accounts.
 
 Make yourself an admin (`hotpocket admin add you@example.com`, your Tailscale
-login), then manage accounts and keys on the status page, https://<gateway>/_gateway.
+login), then manage accounts and keys on the status page, https://<gateway>.
 Developers get their key there too and point Claude Code at the gateway:
   ANTHROPIC_BASE_URL=https://<gateway>  ANTHROPIC_AUTH_TOKEN=<their key>
 """
@@ -389,7 +389,13 @@ async def status_json(request):
     return web.json_response(snap, dumps=lambda d: json.dumps(d, indent=2))
 
 
+@routes.get("/")
 @routes.get("/_gateway")
+async def to_status_page(_request):
+    raise web.HTTPFound("/_gateway/")  # where the page's relative links resolve
+
+
+@routes.get("/_gateway/")
 async def status_page(_request):
     return web.FileResponse(Path(__file__).with_name("ui.html"),
                             headers={**PAGE_HEADERS, "content-type": "text/html; charset=utf-8"})
@@ -559,7 +565,7 @@ def admin_add(args):
     login = args.login.lower()
     check_name(login, "Admin")
     write("INSERT OR IGNORE INTO admins VALUES (?, ?)", login, time.time())
-    print(f"{login} can now manage accounts and keys at https://<gateway>/_gateway.")
+    print(f"{login} can now manage accounts and keys at https://<gateway>.")
 
 
 def admin_rm(args):
