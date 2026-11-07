@@ -32,11 +32,10 @@ tbody th{font-weight:600}
 .num{text-align:right}
 .meter{display:flex;align-items:center;gap:8px;min-width:150px}
 .track{display:flex;flex:1;height:6px;border-radius:3px;background:var(--track);overflow:hidden}
-.track span{flex-shrink:0;border-radius:3px;background:var(--fill)}
+.track span{flex-shrink:0}
+.track span:last-child{border-radius:0 3px 3px 0}
+.track span+span{border-left:2px solid var(--panel)}  /* a gap between parts */
 .tile .track{height:8px;border-radius:4px;margin:8px 0 6px}
-.track .part{border-radius:0}
-.track .part+.part{border-left:2px solid var(--panel)}
-.track .part:last-child{border-radius:0 4px 4px 0}
 .legend{display:flex;flex-wrap:wrap;gap:2px 14px;margin-top:10px;color:var(--mute);font-size:13px}
 .legend i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
 .pct{min-width:3em;text-align:right}
@@ -87,7 +86,6 @@ body:not(.is-admin) .admin-only{display:none!important}
 <p id="offline" class="note bad" hidden>Can't reach the gateway. Retrying…</p>
 <p id="access" class="note" hidden></p>
 <div id="tiles" class="tiles"></div>
-<div id="legend" class="legend"></div>
 
 <section>
   <div class="head"><h2>Accounts</h2><button class="admin-only" data-opens="account-form"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>Add account</button></div>
@@ -209,46 +207,50 @@ async function act(button, question, work) {
 
 // ---------------------------------------------------------------- rendering
 
-// A usage bar for v in 0-1.
-// An account's color: its place in the pool, in a fixed order (gray past the eighth).
+// An account's or developer's color: its place in the list, in a fixed order (gray past the eighth).
 const color = i => `var(--s${i + 1}, var(--mute))`;
 
-// A usage bar for v in 0-1. With parts ({v, name, color}), it is split into one segment per part.
-function bar(v, label, parts = [{v}]) {
-  const fills = parts.map(p => {
-    const fill = h('span', p.color ? {class: 'part', title: p.name} : {});
-    fill.style.width = Math.min(100, p.v * 100) + '%';
-    if (p.color) fill.style.background = p.color;
-    return fill;
-  });
-  return h('span', {class: 'track', role: 'progressbar', 'aria-label': label,
-                    'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(v * 100)}, fills);
-}
+// A usage bar: parts ({v} in 0-1, and a color when there are several) side by side.
+const bar = (parts, label) => h('span', {class: 'track', role: 'progressbar', 'aria-label': label, 'aria-valuemin': 0,
+                                         'aria-valuemax': 100, 'aria-valuenow': Math.round(sum(parts.map(p => p.v)) * 100)},
+  parts.map(p => h('span', {style: `width:${Math.min(100, p.v * 100)}%;background:${p.color ?? 'var(--fill)'}`})));
 
-function tile(label, value, sub, use, parts) {
-  return h('div', {class: 'tile'}, h('div', {class: 'label'}, label), h('div', {class: 'value'}, value),
-           use == null ? null : bar(use, label, parts), h('div', {class: 'sub'}, sub));
+// A stat tile. With parts ({v, color, label, name}), it has a bar split into one segment per part, a legend
+// naming them, and hovering anywhere on it lists them all.
+function tile(label, value, sub, parts) {
+  const t = h('div', {class: 'tile'}, h('div', {class: 'label'}, label), h('div', {class: 'value'}, value),
+    parts && bar(parts.filter(p => p.v > 0), label), h('div', {class: 'sub'}, sub),
+    parts?.length > 1 ? h('div', {class: 'legend'}, parts.map(p => h('span', {}, h('i', {style: `background:${p.color}`}), p.label)))
+                      : null);
+  if (parts) t.title = parts.map(p => p.name).join('\n');
+  return t;
 }
 
 // How much of the whole pool's limit is used: every account's use added up, over all of them. An account
 // with no usage data yet counts as unused, and none counts past its own limit.
-// The bar is split by account, each in its own color, with a segment as wide as its share of the pool.
+// The pool's use of window w, its bar split by account: each segment is that account's share of the pool's limit.
 function poolUse(w, label) {
   const n = snap.accounts.length, known = snap.accounts.some(a => a[w] != null);
-  const parts = snap.accounts.map((a, i) => ({v: Math.min(1, a[w] || 0) / n, color: color(i),
+  const parts = snap.accounts.map((a, i) => ({v: Math.min(1, a[w] || 0) / n, color: color(i), label: a.label,
                                               name: `${a.label}: ${pct(Math.min(1, a[w] || 0))} of its limit used`}));
   const use = known ? sum(parts.map(p => p.v)) : null;
-  const t = tile(label, known ? pct(use) : '–', known ? left(use) + ' of usage limit total' : 'no data yet', use,
-                 parts.filter(p => p.v > 0));
-  if (known) t.title = parts.map(p => p.name).join('\n');  // hovering anywhere on the tile lists every account
-  return t;
+  return tile(label, known ? pct(use) : '–', known ? left(use) + ' of usage limit total' : 'no data yet', known ? parts : null);
+}
+
+// The same, split by developer: each one's estimated share of the pool's limit (see Pool.snapshot).
+function devUse(w, label) {
+  const known = snap.accounts.some(a => a[w] != null);
+  const parts = snap.developers.map((d, i) => ({v: d[w] || 0, color: color(i), label: d.name,
+                                                name: `${d.name}: ${pct(d[w] || 0)} of the pool's limit`}));
+  const use = known ? sum(parts.map(p => p.v)) : null;
+  return tile(label, known ? pct(use) : '–', known ? 'estimated from what their requests cost' : 'no data yet', known ? parts : null);
 }
 
 function meterCell(a, w, label) {
   const v = a[w], reset = a[w + '_reset'];
   if (v == null) return h('td', {class: 'sub', 'data-label': label}, 'no data yet');
   return h('td', {'data-label': label},
-    h('div', {class: 'meter'}, bar(v, `${a.label} ${label} use`), h('span', {class: 'pct'}, pct(v))),
+    h('div', {class: 'meter'}, bar([{v}], `${a.label} ${label} use`), h('span', {class: 'pct'}, pct(v))),
     h('div', {class: 'sub', title: reset > now() ? clock(reset) : ''}, left(v) + (reset > now() ? ' · resets ' + until(reset) : '')));
 }
 
@@ -296,16 +298,9 @@ function accountRow(a) {
       h('button', {class: 'bad', onclick: e => removeAccount(e.target, a.label)}, icon('trash-2'), 'Remove'))));
 }
 
-// A developer's share of the pool's limit, an estimate: see shareHead.
-const shareCell = (d, w, label) => h('td', {'data-label': label},
-  h('div', {class: 'meter'}, bar(d[w] || 0, `${d.name} ${label} use`), h('span', {class: 'pct'}, pct(d[w] || 0))));
-const shareHead = label => h('th', {title: `Share of the pool's ${label.toLowerCase()} limit this developer used. ` +
-  "Estimated: each account's use is split between the developers who used it, by what their requests would cost."}, label);
-
 function devRow(d) {
   return h('tr', {},
     h('th', {scope: 'row'}, d.name),
-    shareCell(d, 'five_hour', '5-hour'), shareCell(d, 'seven_day', 'Weekly'),
     usageCell(d),
     h('td', {title: clock(d.last_seen), 'data-label': 'Last seen'}, ago(d.last_seen)),
     h('td', {'data-label': 'Last account'}, d.last_account || '–'),
@@ -338,16 +333,15 @@ function render() {
   renderMine(viewer);
 
   const cost = sum(accounts.map(a => a.cost || 0)), all = sum(accounts.map(a => tokens(a.tokens)));
-  $('#legend').replaceChildren(...accounts.map((a, i) => h('span', {}, h('i', {style: `background:${color(i)}`}), a.label)));
-  $('#legend').hidden = accounts.length < 2;  // one account needs no key
   $('#tiles').replaceChildren(poolUse('five_hour', '5-hour'), poolUse('seven_day', 'Weekly'),
+    devUse('five_hour', '5-hour by developer'), devUse('seven_day', 'Weekly by developer'),
     tile('Est. API cost', money(cost), `${count(all)} tokens since ` +
          new Date(snap.since * 1000).toLocaleDateString([], {month: 'short', day: 'numeric'})));
 
   const usageHead = () => h('th', {class: 'num', title: 'Tokens, and what they would cost at API prices'}, 'Usage');
   table('#accounts', ['Account', 'State', '5-hour', 'Weekly', usageHead(), h('th', {class: 'admin-only'})],
         accounts.map(accountRow), 'No accounts yet.');
-  table('#developers', ['Name', shareHead('5-hour'), shareHead('Weekly'), usageHead(), 'Last seen', 'Last account', h('th')],
+  table('#developers', ['Name', usageHead(), 'Last seen', 'Last account', h('th')],
         developers.map(devRow), 'No developers yet.');
 }
 

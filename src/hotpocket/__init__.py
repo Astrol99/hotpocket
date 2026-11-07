@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import functools
 import hashlib
-import itertools
 import json
 import math
 import os
@@ -156,13 +155,6 @@ def key_names():
 
 CHANGED = None  # set (and replaced) whenever usage changes; open status pages wait on it. None when stopped.
 
-
-def changed():
-    global CHANGED
-    if CHANGED:
-        CHANGED.set()
-        CHANGED = asyncio.Event()
-
 # Everything here runs on the event loop's single thread, so no locks are needed.
 
 class Pool:
@@ -174,6 +166,14 @@ class Pool:
         self.sessions = {}                          # session id -> (label, last seen)
         self.since = saved.get("since") or time.time()  # when token counting started
         self.dirty = False
+
+    def touch(self):
+        """Something the status page shows changed: save it at the next tick, and wake open pages now."""
+        global CHANGED
+        self.dirty = True
+        if CHANGED:
+            CHANGED.set()
+            CHANGED = asyncio.Event()
 
     def _acct(self, label):
         return self.accounts.setdefault(label, {"requests": 0})
@@ -208,13 +208,13 @@ class Pool:
             for key, value in ((window, num(headers, f"{UNIFIED}{infix}-utilization")),
                                (window + "_reset", num(headers, f"{UNIFIED}{infix}-reset"))):
                 if value is not None:
-                    a[key], a["usage_at"], self.dirty = value, time.time(), True  # when it was last heard
+                    a[key], a["usage_at"] = value, time.time()  # when it was last heard
+        self.touch()
 
     def block(self, label, token, kind, until, claim=None):
         self._acct(label).update(blocked_kind=kind, blocked_until=until, blocked_claim=claim,
                                  blocked_token=key_hash(token)[:16])  # which token earned it
-        self.dirty = True
-        changed()
+        self.touch()
         hint = "; replace its token on the status page" if kind == "auth" else ""
         log(f"account {label}: {REASONS[kind]}{hint}; back in {until_text(until)}")
 
@@ -230,13 +230,11 @@ class Pool:
             entry["cost"] = entry.get("cost", 0) + cost
             entry["tokens"] = Counter(entry.get("tokens"))
             entry["tokens"].update({f: usage.get(f) or 0 for f in TOKEN_FIELDS})
-        d["last_seen"], d["last_account"] = time.time(), label
-        self.dirty = True
-        changed()
+        d["last_seen"], d["last_account"] = now, label
+        self.touch()
 
     def snapshot(self, accounts, keys):
-        now = time.time()
-        rows = []
+        now, rows, shares = time.time(), [], {w: Counter() for w in WINDOWS}
         for label, token in accounts.items():
             a = self.accounts.get(label, {})
             blocked = self.blocked(label, token, now)
@@ -249,15 +247,13 @@ class Pool:
                 "usage_at": a.get("usage_at"), "requests": a.get("requests", 0),
                 "tokens": a.get("tokens", {}), "cost": a.get("cost", 0),
             })
-        # A developer's share of the pool's limits: each account's use, split between the developers who
-        # used it in its current window by what their requests would cost at API prices.
-        shares = {w: Counter() for w in WINDOWS}
-        for label, w in itertools.product(accounts, WINDOWS):
-            a = self.accounts.get(label, {})
-            spent, use = a.get("spent", {}).get(w), min(1, used(a, w, now) or 0)
-            if spent and (spent["reset"] or 0) > now and (total := sum(spent["devs"].values())):
-                for dev, cost in spent["devs"].items():
-                    shares[w][dev] += use * cost / total / len(accounts)
+            # Developers' shares of the pool's limits: the account's use in its current window, split between
+            # the developers who used it by what their requests would cost at API prices.
+            for w in WINDOWS:
+                spent, use = a.get("spent", {}).get(w), min(1, used(a, w, now) or 0)
+                if spent and (spent["reset"] or 0) > now and (total := sum(spent["devs"].values())):
+                    for dev, cost in spent["devs"].items():
+                        shares[w][dev] += use * cost / total / len(accounts)
         devs = [{"name": n, "requests": 0, **self.devs.get(n, {}), **{w: shares[w][n] for w in WINDOWS}} for n in keys]
         return {"accounts": rows, "developers": devs, "since": self.since}
 
@@ -575,7 +571,7 @@ async def delete_key(_request, name):
     name = name.lower()
     remove("keys", "name", name, "developer key")
     if POOL.devs.pop(name, None):  # their history goes with them
-        POOL.dirty = True
+        POOL.touch()
     return f"removed developer {name}", {}
 
 
