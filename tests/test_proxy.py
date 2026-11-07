@@ -12,10 +12,10 @@ from hotpocket.usage import UNIFIED as U
 from conftest import block, call, dev, status, toks, use_accounts
 
 
-async def test_keyless_requests_never_reach_the_api(gw, capsys):
+async def test_keyless_requests_never_reach_the_api(gw, caplog):
     assert (await gw.head("/api/hello")).status == 200  # Claude Code's connectivity check
     assert (await gw.get("/favicon.ico")).status == 403
-    assert "favicon" not in capsys.readouterr().out  # browser probes leave no log line
+    assert "favicon" not in caplog.text  # browser probes leave no log line
     assert gw.seen == []
 
 
@@ -91,12 +91,12 @@ async def test_absolute_form_target_goes_to_the_api_not_its_host(gw):
     assert b" 200 " in status_line and gw.seen[-1]["path"] == "/v1/messages"
 
 
-async def test_truncated_upstream_stream_reaches_the_developer_as_an_error(gw, capsys):
+async def test_truncated_upstream_stream_reaches_the_developer_as_an_error(gw, caplog):
     use_accounts("TRUNC")
     resp = await gw.post("/v1/messages", headers=gw.dev, data=b"{}")
     with pytest.raises(aiohttp.ClientPayloadError):
         await resp.read()
-    assert "stream ended early" in capsys.readouterr().out
+    assert "stream ended early" in caplog.text
 
 
 # --------------------------------------------------------------------------- accounts that turn a request down
@@ -122,7 +122,7 @@ async def test_rejected_and_throttled_accounts_are_skipped(gw):
 
 
 @pytest.mark.parametrize("suffixes", [["THROTTLE"], ["THROTTLE", "SLOWDOWN"]])
-async def test_a_429_from_every_account_comes_back_as_is_and_blocks_no_one(gw, capsys, suffixes):
+async def test_a_429_from_every_account_comes_back_as_is_and_blocks_no_one(gw, caplog, suffixes):
     # Such a 429 can be about the request itself, so one request mustn't lock everyone out.
     use_accounts(*suffixes)
     resp, body = await call(gw)
@@ -132,14 +132,14 @@ async def test_a_429_from_every_account_comes_back_as_is_and_blocks_no_one(gw, c
     assert resp.headers.get("x-should-retry") == ("false" if last == "SLOWDOWN" else None)
     assert resp.content_type == "application/json"
     assert not any("blocked_kind" in a for a in (await status(gw))["accounts"].values())
-    assert f"(429: {last} says no)" in capsys.readouterr().out
+    assert f"(429: {last} says no)" in caplog.text
 
 
-async def test_a_429_that_isnt_json_comes_back_as_an_api_error(gw, capsys):
+async def test_a_429_that_isnt_json_comes_back_as_an_api_error(gw, caplog):
     use_accounts("GARBLED")
     resp, _ = await call(gw)
     assert resp.status == 429 and (await resp.json())["error"]["type"] == "rate_limit_error"
-    assert "(429: <html>slow down</html>)" in capsys.readouterr().out
+    assert "(429: <html>slow down</html>)" in caplog.text
 
 
 async def test_a_revoked_token_is_blocked_and_any_other_403_tries_the_next_account(gw):

@@ -9,10 +9,11 @@ import time
 
 import aiohttp
 from aiohttp import web
+from humanize import naturaldelta
 from multidict import CIMultiDict
 from yarl import URL
 
-from .log import log, refused, until_text
+from .log import log, refused
 from .pool import POOL
 from .store import key_owner, load_accounts
 from .usage import UNIFIED, reset_time, usage_of
@@ -79,7 +80,7 @@ async def proxy(request):
             resp = await request.app[CLIENT].request(request.method, url, headers=headers, data=body or None,
                                                      allow_redirects=False)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            log(f"{tag} -> {label}: upstream error {e!r}")
+            log.warning(f"{tag} -> {label}: upstream error {e!r}")
             return api_error(502, "api_error", f"hotpocket: could not reach the Anthropic API ({type(e).__name__}).")
         async with resp:
             pool.observe(label, resp.headers)
@@ -89,7 +90,7 @@ async def proxy(request):
             out, reply = await relay(request, resp, f"{tag} -> {label}")
         pool.served(label, session, dev, *usage_of(reply))
         switched = f" (switched from {', '.join(tried[:-1])})" if len(tried) > 1 else ""
-        log(f"{tag} -> {label} {resp.status} {time.time() - started:.1f}s{switched}")
+        log.info(f"{tag} -> {label} {resp.status} {time.time() - started:.1f}s{switched}")
         return out
     if turned:
         return refused_by_all(tag, tried, *turned)
@@ -155,7 +156,7 @@ async def relay(request, resp, what):
             await out.write(chunk)
         await out.write_eof()
     except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
-        log(f"{what}: stream ended early ({e!r})")  # upstream or developer dropped mid-stream
+        log.warning(f"{what}: stream ended early ({e!r})")  # upstream or developer dropped mid-stream
         # Drop the developer's connection without the final chunk, so a truncated
         # body is seen as a failure instead of a complete response.
         if request.transport is not None:
@@ -169,7 +170,7 @@ def refused_by_all(tag, tried, status, headers, error):
         message = str(json.loads(error)["error"]["message"])
     except (ValueError, KeyError, TypeError):
         message = None
-    log(f"{tag}: refused by {', '.join(tried)} ({status}: {(message or error.decode(errors='replace'))[:200]})")
+    log.warning(f"{tag}: refused by {', '.join(tried)} ({status}: {(message or error.decode(errors='replace'))[:200]})")
     if message is not None:  # Anthropic's own answer, with its retry-after and x-should-retry
         headers.setdefault("content-type", "application/json")
         return web.Response(status=status, body=error, headers=headers)
@@ -182,17 +183,18 @@ def refused_by_all(tag, tried, status, headers, error):
 def all_blocked(pool, tag, accounts):
     """Every account is blocked: answer according to why."""
     if not (first := pool.first_back(accounts)):
-        log(f"{tag}: all {len(accounts)} account tokens rejected")
+        log.warning(f"{tag}: all {len(accounts)} account tokens rejected")
         return api_error(403, "permission_error", "hotpocket: every team account token was "
                          "rejected. Ask your admin to replace them.")
     until, claim = first
     reset = max(until, time.time() + 1)
-    log(f"{tag}: all {len(accounts)} accounts blocked; first back in {until_text(reset)}")
+    back = naturaldelta(reset - time.time())
+    log.warning(f"{tag}: all {len(accounts)} accounts blocked; first back in {back}")
     # Shaped like a subscription usage limit so Claude Code shows its normal
     # "limit reached, resets at ..." message (and can wait for the reset).
     return api_error(429, "rate_limit_error",
                      f"hotpocket: all {len(accounts)} team accounts are at their usage limit "
-                     f"or unavailable. The first one is back in {until_text(reset)}.",
+                     f"or unavailable. The first one is back in {back}.",
                      headers={UNIFIED + "status": "rejected", UNIFIED + "reset": str(math.ceil(reset)),
                               UNIFIED + "representative-claim": claim or "five_hour",
                               "retry-after": str(math.ceil(reset - time.time()))})

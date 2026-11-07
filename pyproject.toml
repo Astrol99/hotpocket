@@ -5,7 +5,11 @@ description = "One Claude Code endpoint for a team, backed by a pool of Claude a
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
-dependencies = ["aiohttp>=3.9", "genai-prices>=0.2.1"]
+dependencies = [
+    "aiohttp>=3.9",
+    "genai-prices>=0.2.1",
+    "humanize>=4.16.0",
+]
 
 [project.scripts]
 hotpocket = "hotpocket.server:main"

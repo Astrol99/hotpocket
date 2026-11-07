@@ -98,7 +98,7 @@ def page_api(role):
             except sqlite3.OperationalError as e:  # e.g. locked by a long write elsewhere
                 refused(request, f"database error ({e})")
                 return api_error(503, "overloaded_error", "The database is busy; try again in a moment.")
-            log(f"{'admin ' if role == 'admin' else ''}{source(request)}: {done}")
+            log.info(f"{'admin ' if role == 'admin' else ''}{source(request)}: {done}")
             request.app[POOL].touch()  # open pages show the change right away
             return web.json_response(result, headers={"cache-control": "no-store"})  # may hold a new key
         return wrapped

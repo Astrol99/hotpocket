@@ -2,6 +2,7 @@
 Tailscale serve reaches it through."""
 
 import asyncio
+import logging
 import os
 import socket
 import sqlite3
@@ -29,12 +30,12 @@ def make_app():
 async def lifespan(app):
     pool = app[POOL] = Pool()
     ticking = asyncio.create_task(tick(pool))
-    log(f"listening on {SOCKET} -> {proxy.UPSTREAM} "
+    log.info(f"listening on {SOCKET} -> {proxy.UPSTREAM} "
         f"({len(load_accounts())} accounts, {len(key_names())} developer keys)")
     yield
     ticking.cancel()
     pool.tick()
-    log("stopped")
+    log.info("stopped")
 
 
 async def tick(pool):
@@ -43,7 +44,7 @@ async def tick(pool):
         try:
             pool.tick()
         except sqlite3.Error as e:
-            log(f"could not save usage: {e}")
+            log.error(f"could not save usage: {e}")
 
 
 def main():
@@ -52,6 +53,7 @@ def main():
     with socket.socket(socket.AF_UNIX) as s:
         if s.connect_ex(SOCKET) == 0:
             raise SystemExit(f"hotpocket is already running on {SOCKET}.")
+    logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     os.umask(0o077)  # owner-only files: the database holds account tokens, and the socket believes whoever connects
     # aiohttp waits shutdown_timeout twice for a request still running, which must fit in Docker's 10 s
     # stop grace for the final save to run.

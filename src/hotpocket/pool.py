@@ -6,8 +6,9 @@ import time
 from collections import Counter
 
 from aiohttp import web
+from humanize import naturaldelta
 
-from .log import log, until_text
+from .log import log
 from .store import key_hash, key_names, load_accounts, save_usage, saved_usage
 from .usage import TOKEN_FIELDS, WINDOWS, api_cost, limits
 
@@ -97,8 +98,10 @@ class Pool:
         self._acct(label).update(blocked_kind=kind, blocked_until=until or time.time(), blocked_claim=claim,
                                  blocked_token=key_hash(token)[:16])  # which token earned it
         self.touch()
-        log(f"account {label}: {REASONS[kind]}; "
-            + (f"back in {until_text(until)}" if until else "replace its token on the status page"))
+        if until:
+            log.info(f"account {label}: {REASONS[kind]}; back in {naturaldelta(until - time.time())}")
+        else:
+            log.warning(f"account {label}: {REASONS[kind]}; replace its token on the status page")
 
     def served(self, label, session, dev, model, usage):
         """An account served a request: it stays the session's account, and the request is counted."""
