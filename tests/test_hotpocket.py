@@ -230,6 +230,7 @@ async def test_status_shows_usage_blocks_and_developers_but_no_tokens_and_surviv
     acc = snap["accounts"]
     assert acc["limited"]["blocked_kind"] == "limit" and acc["limited"]["blocked_until"] > time.time() + 7000
     assert acc["good"]["five_hour"] == 0.42 and acc["good"]["requests"] == 1
+    assert time.time() - acc["good"]["usage_at"] < 5  # when that usage was heard, for the page's "as of"
     assert [(d["name"], d["requests"]) for d in snap["developers"]] == [("alice", 1)]
     assert "sk-ant" not in str(snap)
     await gw.close()  # shutting down saves usage

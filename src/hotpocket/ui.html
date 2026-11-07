@@ -15,7 +15,7 @@ h1{font-size:22px;margin:0;letter-spacing:-.01em}
 h2{font-size:16px;margin:0}
 .head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:36px 0 6px}
 h3{font-size:14px;margin:0 0 2px}
-#who,.sub,.label{color:var(--mute);font-size:13px}
+#who,.sub,.label{color:var(--mute);font-size:13px;font-weight:400}
 .note{background:var(--panel);border-radius:10px;padding:10px 14px;margin:16px 0 0}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:20px}
 .tile,.panel{background:var(--panel);border-radius:12px;padding:14px 16px}
@@ -210,9 +210,17 @@ function table(id, cols, rows, none) {
     h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', {colspan: cols.length, class: 'sub'}, none))));
 }
 
+// Usage is only heard in the API's replies, so it's as old as the account's last request through
+// hotpocket; use elsewhere (claude.ai, a direct login) doesn't show until then. Say so once it's stale.
+function usageAge(a) {
+  if (a.five_hour == null && a.seven_day == null || now() - a.usage_at < 600) return null;
+  return h('div', {class: 'sub', title: clock(a.usage_at)},
+           a.usage_at ? 'usage as of ' + ago(a.usage_at) : 'usage from an earlier request');
+}
+
 function accountRow(a) {
   return h('tr', {},
-    h('th', {scope: 'row'}, a.label), stateCell(a), meterCell(a, 'five_hour', '5-hour'), meterCell(a, 'seven_day', 'Weekly'),
+    h('th', {scope: 'row'}, a.label, usageAge(a)), stateCell(a), meterCell(a, 'five_hour', '5-hour'), meterCell(a, 'seven_day', 'Weekly'),
     h('td', {class: 'num', 'data-label': 'Sessions'}, a.active_sessions),
     h('td', {class: 'num', 'data-label': 'Requests'}, a.requests),
     h('td', {class: 'actions admin-only'},

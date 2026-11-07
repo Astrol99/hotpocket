@@ -168,7 +168,7 @@ class Pool:
             for key, value in ((window, num(headers, f"{UNIFIED}{infix}-utilization")),
                                (window + "_reset", num(headers, f"{UNIFIED}{infix}-reset"))):
                 if value is not None:
-                    a[key], self.dirty = value, True
+                    a[key], a["usage_at"], self.dirty = value, time.time(), True  # when it was last heard
 
     def block(self, label, token, kind, until, claim=None):
         self._acct(label).update(blocked_kind=kind, blocked_until=until, blocked_claim=claim,
@@ -197,7 +197,7 @@ class Pool:
                 "blocked_reason": REASONS.get(a["blocked_kind"]) if blocked else None,
                 "blocked_until": a["blocked_until"] if blocked else None,
                 **{w: used(a, w, now) for w in WINDOWS}, **{w + "_reset": a.get(w + "_reset") for w in WINDOWS},
-                "requests": a.get("requests", 0), "active_sessions": active[label],
+                "usage_at": a.get("usage_at"), "requests": a.get("requests", 0), "active_sessions": active[label],
             })
         devs = [{"name": n, "requests": 0, **self.devs.get(n, {})} for n in keys]
         return {"accounts": rows, "developers": devs}
