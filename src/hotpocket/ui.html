@@ -12,7 +12,8 @@
 body{background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;margin:0 auto;padding:24px 16px 72px;max-width:1000px}
 header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 16px}
 h1{font-size:22px;margin:0;letter-spacing:-.01em}
-h2{font-size:16px;margin:36px 0 6px}
+h2{font-size:16px;margin:0}
+.head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:36px 0 6px}
 h3{font-size:14px;margin:0 0 2px}
 #who,.sub,.label{color:var(--mute);font-size:13px}
 .note{background:var(--panel);border-radius:10px;padding:10px 14px;margin:16px 0 0}
@@ -72,9 +73,9 @@ body:not(.is-admin) .admin-only{display:none!important}
 </div>
 
 <section>
-  <h2>Accounts</h2>
+  <div class="head"><h2>Accounts</h2><button class="admin-only" data-opens="account-form">Add account</button></div>
   <div class="wrap"><table id="accounts"></table></div>
-  <form id="account-form" class="panel admin-only" autocomplete="off">
+  <form id="account-form" class="panel admin-only" autocomplete="off" hidden>
     <h3>Add an account, or replace its token</h3>
     <p class="sub">Run <code>claude setup-token</code>, open the link it prints in a private browser window
       signed in as that account, and paste the token it gives you. Saving under an existing label replaces
@@ -88,7 +89,7 @@ body:not(.is-admin) .admin-only{display:none!important}
 </section>
 
 <section>
-  <h2>Developers</h2>
+  <div class="head"><h2>Developers</h2><button class="admin-only" data-opens="key-form">Add developer</button></div>
   <div class="wrap"><table id="developers"></table></div>
   <div id="reveal" class="panel" hidden>
     <h3 id="reveal-title"></h3>
@@ -98,7 +99,7 @@ body:not(.is-admin) .admin-only{display:none!important}
     <button id="reveal-copy" class="primary">Copy</button>
     <button id="reveal-done">Done</button>
   </div>
-  <form id="key-form" class="panel admin-only" autocomplete="off">
+  <form id="key-form" class="panel admin-only" autocomplete="off" hidden>
     <h3>Give a developer a key</h3>
     <div class="row">
       <label>Name<input name="dev" required maxlength="254" placeholder="alice@example.com" spellcheck="false"></label>
@@ -250,7 +251,7 @@ function renderMine(v) {
 }
 
 function render() {
-  const {accounts, developers, available, viewer} = snap;
+  const {accounts, developers, viewer} = snap;
   document.body.classList.toggle('is-admin', viewer.admin);
   $('#who').textContent = viewer.login ? viewer.login + (viewer.admin ? ' · admin' : '') : '';
   const note = accessNote(viewer);
@@ -258,11 +259,7 @@ function render() {
   $('#access').hidden = !note;
   renderMine(viewer);
 
-  const down = accounts.length - available;
-  $('#tiles').replaceChildren(
-    tile('Accounts ready', `${available} of ${accounts.length}`,
-         !accounts.length ? 'none added yet' : down ? `${down} unavailable` : 'all available'),
-    poolUse('five_hour', '5-hour use'), poolUse('seven_day', 'Weekly use'));
+  $('#tiles').replaceChildren(poolUse('five_hour', '5-hour use'), poolUse('seven_day', 'Weekly use'));
 
   table('#accounts', ['Account', 'State', '5-hour', 'Weekly',
                       h('th', {class: 'num', title: 'Active in the last hour'}, 'Sessions'),
@@ -290,8 +287,17 @@ async function refresh() {
 
 const path = (kind, name) => `${kind}/${encodeURIComponent(name)}`;
 
+// "Add account" and "Add developer" open their form (a second click closes it); saving closes it too.
+function toggle(id, open) {
+  const f = $('#' + id);
+  f.hidden = !(open ?? f.hidden);
+  if (!f.hidden) f.querySelector('input').focus();
+  return f;
+}
+document.querySelectorAll('[data-opens]').forEach(b => b.addEventListener('click', () => toggle(b.dataset.opens)));
+
 function replaceToken(label) {
-  const f = $('#account-form');
+  const f = toggle('account-form', true);
   f.elements.label.value = label;
   f.elements.token.focus();
   f.scrollIntoView({block: 'center', behavior: 'smooth'});
@@ -350,14 +356,14 @@ $('#account-form').addEventListener('submit', async e => {
   if (await act(f.querySelector('button'), null, async () => {
     await api('PUT', path('accounts', label), {token: f.elements.token.value});
     toast(replacing ? `Replaced the token for ${label}.` : `Added ${label}.`);
-  })) f.reset();
+  })) { f.reset(); f.hidden = true; }
 });
 
 $('#key-form').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target, name = f.elements.dev.value.trim().toLowerCase();
   const replacing = Boolean(keyOf(name));
-  if (await makeKey(f.querySelector('button'), name, replacing)) f.reset();
+  if (await makeKey(f.querySelector('button'), name, replacing)) { f.reset(); f.hidden = true; }
 });
 
 refresh();

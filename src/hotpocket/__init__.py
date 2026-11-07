@@ -200,7 +200,7 @@ class Pool:
                 "requests": a.get("requests", 0), "active_sessions": active[label],
             })
         devs = [{"name": n, "requests": 0, **self.devs.get(n, {})} for n in keys]
-        return {"accounts": rows, "available": sum(r["available"] for r in rows), "developers": devs}
+        return {"accounts": rows, "developers": devs}
 
     def tick(self):
         """Every few seconds: forget idle sessions and save state if it changed."""
