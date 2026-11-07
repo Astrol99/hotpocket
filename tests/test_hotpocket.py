@@ -253,16 +253,21 @@ async def test_a_revoked_token_is_blocked_and_any_other_403_tries_the_next_accou
     assert resp.status == 403 and b"NOMODEL says no" in body  # no account takes it: Anthropic's own answer
 
 
-async def test_rejected_tokens_get_a_try_when_nothing_else_is_left(gw):
+async def test_rejected_tokens_get_a_try_only_when_nothing_else_is_left(gw):
+    use_accounts("BAD", "GOOD")
+    hotpocket.POOL.block("bad", "sk-ant-oat01-BAD", "auth")
+    hotpocket.POOL.accounts["bad"]["blocked_until"] = 0  # however long ago that was
+    await call(gw)
+    assert [s["tok"] for s in gw.seen] == ["GOOD"]
     # So if Anthropic rejected every token at once, the first request after it recovers brings the pool back.
     use_accounts("GOOD")
-    hotpocket.POOL.block("good", "sk-ant-oat01-GOOD", "auth", time.time() + 600)
+    hotpocket.POOL.block("good", "sk-ant-oat01-GOOD", "auth")
     assert (await call(gw))[0].status == 200
     assert "blocked_kind" not in (await status(gw))["accounts"]["good"]
     # Tokens that stay rejected cost each request one try, the longest-rejected first, not one per token.
     use_accounts("BAD", "REVOKED")
     for tok in ("BAD", "REVOKED"):
-        hotpocket.POOL.block(tok.lower(), f"sk-ant-oat01-{tok}", "auth", time.time() + 600)
+        hotpocket.POOL.block(tok.lower(), f"sk-ant-oat01-{tok}", "auth")
     for expected in ("BAD", "REVOKED", "BAD"):
         seen = len(gw.seen)
         assert (await call(gw))[0].status == 403 and [s["tok"] for s in gw.seen[seen:]] == [expected]
@@ -272,8 +277,6 @@ async def test_rejected_token_is_403_and_its_replacement_used_at_once(gw):
     use_accounts("BAD")
     resp, body = await call(gw)
     assert resp.status == 403 and b"rejected" in body
-    hotpocket.POOL.accounts["bad"]["blocked_until"] = 0  # its block lapses, for a retry, but nothing was fixed
-    assert (await status(gw))["accounts"]["bad"]["blocked_kind"] == "auth"
     hotpocket.save_account("bad", "sk-ant-oat01-FIXED")
     assert (await call(gw))[0].status == 200 and gw.seen[-1]["tok"] == "FIXED"
 
@@ -288,12 +291,14 @@ async def test_truncated_upstream_stream_reaches_the_developer_as_an_error(gw, c
 
 # --------------------------------------------------------------------------- status
 
-async def test_open_status_pages_hear_when_usage_changes(gw):
+async def test_open_status_pages_get_their_data_and_every_change(gw):
     assert (await gw.head("/_gateway/events")).status == 403  # not the stream: its reply would end at the headers
-    events = await gw.get("/_gateway/events")
+    events = await gw.get("/_gateway/events", headers=as_user())
     assert events.headers["content-type"] == "text/event-stream"
+    data = lambda: asyncio.wait_for(events.content.readuntil(b"\n\n"), 5)
+    assert json.loads((await data()).removeprefix(b"data: "))["viewer"]["admin"]  # at once, for whoever opened it
     await call(gw)
-    assert await asyncio.wait_for(events.content.readline(), 5) == b"data: changed\n"
+    assert [d["requests"] for d in json.loads((await data()).removeprefix(b"data: "))["developers"]] == [1]
 
 
 async def test_developers_share_the_pool_limits_by_what_their_requests_cost(gw):

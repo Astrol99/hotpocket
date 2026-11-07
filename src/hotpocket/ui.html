@@ -199,7 +199,7 @@ async function act(button, question, work) {
   button.disabled = true;
   try { await work(); return true; }
   catch (e) { toast(e.message); return false; }
-  finally { button.disabled = false; refresh(); }
+  finally { button.disabled = false; }
 }
 
 // ---------------------------------------------------------------- rendering
@@ -254,9 +254,10 @@ function meterCell(a, w, label) {
 function stateCell(a) {
   if (!a.blocked_kind) return h('td', {'data-label': 'State'}, h('span', {class: 'ok'}, '● Ready'));
   const reason = a.blocked_reason[0].toUpperCase() + a.blocked_reason.slice(1);
-  const next = a.blocked_kind === 'auth' ? 'replace its token' : 'back ' + until(a.blocked_until);
+  const auth = a.blocked_kind === 'auth';  // its time is when it was rejected, not when it's back
   return h('td', {'data-label': 'State'}, h('span', {class: 'bad'}, '● ' + reason),
-           h('div', {class: 'sub', title: clock(a.blocked_until)}, next));
+           h('div', {class: 'sub', title: (auth ? 'since ' : '') + clock(a.blocked_until)},
+             auth ? 'replace its token' : 'back ' + until(a.blocked_until)));
 }
 
 function table(id, cols, rows, none) {
@@ -329,19 +330,6 @@ function render() {
   $('#dev-tiles').replaceChildren(devUse('five_hour', '5-hour by developer'), devUse('seven_day', 'Weekly by developer'));
   table('#developers', ['Name', usageHead(), 'Last seen', 'Last account', h('th')],
         developers.map(devRow), 'No developers yet.');
-}
-
-async function refresh() {
-  try {
-    const r = await fetch('/_gateway/status', {cache: 'no-store'});
-    if (!r.ok) throw new Error();
-    snap = await r.json();
-  } catch {
-    $('#offline').hidden = false;
-    return;
-  }
-  $('#offline').hidden = true;
-  render();  // a rendering bug shows in the console, not as "can't reach the gateway"
 }
 
 // ---------------------------------------------------------------- actions
@@ -435,19 +423,23 @@ $('#key-form').addEventListener('submit', async e => {
   if (await makeKey(f.querySelector('button'), name)) { f.reset(); f.hidden = true; }
 });
 
-refresh();
-const autoRefresh = () => { if (!document.hidden && !$(':popover-open')) refresh(); };  // not under an open menu
-setInterval(autoRefresh, 15000);
-// The gateway also says when usage changes (a reply finished, an account hit its limit): refresh then,
-// at most once a second. The browser reconnects by itself after a dropped connection, but gives up on an
-// error reply (say a 502 from the proxy while the gateway restarts), so then this starts over.
-let soon = null;
+// The gateway sends the page's data when it opens, when it changes, and every 30 s. The browser reconnects
+// by itself after a dropped connection, but gives up on an error reply (say a 502 from the proxy while the
+// gateway restarts), so then this starts over.
 (function listen() {
   const events = new EventSource('/_gateway/events');
-  events.onmessage = () => { soon ??= setTimeout(() => { soon = null; autoRefresh(); }, 1000); };
-  events.onerror = () => { if (events.readyState === EventSource.CLOSED) setTimeout(listen, 5000); };
+  events.onmessage = e => {
+    snap = JSON.parse(e.data);
+    $('#offline').hidden = true;
+    if (!$(':popover-open')) render();  // not under an open menu
+  };
+  events.onerror = () => {
+    $('#offline').hidden = false;
+    if (events.readyState === EventSource.CLOSED) setTimeout(listen, 5000);
+  };
 })();
-document.addEventListener('visibilitychange', autoRefresh);
+// Data that came while a menu was open shows once it closes (toggle doesn't bubble, hence the capture).
+document.addEventListener('toggle', e => { if (e.newState === 'closed' && snap && !$(':popover-open')) render(); }, true);
 </script>
 </body>
 </html>

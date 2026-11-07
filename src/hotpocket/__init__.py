@@ -31,7 +31,6 @@ OAUTH_BETA = "oauth-2025-04-20"
 UNIFIED = "anthropic-ratelimit-unified-"
 WINDOWS = {"five_hour": "5h", "seven_day": "7d"}  # our field name -> header infix
 STICKY_MAX_UTIL = 0.95      # move a session off its account above this utilization
-AUTH_FAIL_COOLDOWN = 600    # a token the API rejected (401)
 FALLBACK_BLOCK = 3600       # usage-limit rejection without a reset time
 SESSION_TTL = 6 * 3600
 MAX_BODY = 32 * 1024 * 1024  # the Messages API's own request size limit
@@ -166,9 +165,11 @@ class Pool:
         return self.accounts.setdefault(label, {"requests": 0})
 
     def blocked(self, label, token, now):
-        # A block belongs to the token that earned it, so replacing a token clears it.
+        # A block belongs to the token that earned it, so replacing a token clears it. A rejected token stays
+        # blocked until it works again (see choose), a usage limit until it resets.
         a = self.accounts.get(label, {})
-        return a.get("blocked_until", 0) > now and a.get("blocked_token") == key_hash(token)[:16]
+        return (a.get("blocked_token") == key_hash(token)[:16]
+                and (a.get("blocked_kind") == "auth" or a.get("blocked_until", 0) > now))
 
     def _util(self, label):
         a, now = self.accounts.get(label, {}), time.time()
@@ -179,7 +180,7 @@ class Pool:
         left = [l for l in accounts if l not in exclude]
         ready = [l for l in left if not self.blocked(l, accounts[l], now)]
         if not ready:
-            # A rejected token gets another try when nothing else is left (the request would fail anyway),
+            # A rejected token is only tried again when nothing else is left (the request would fail anyway),
             # so if Anthropic rejected every token at once, the pool is back as soon as it recovers. Only one
             # per request, the longest-rejected first: revoked tokens cost a request one call, not one each.
             rejected = [l for l in left if self.accounts[l].get("blocked_kind") == "auth"]
@@ -201,12 +202,13 @@ class Pool:
         if heard:
             self.touch()
 
-    def block(self, label, token, kind, until, claim=None):
-        self._acct(label).update(blocked_kind=kind, blocked_until=until, blocked_claim=claim,
+    def block(self, label, token, kind, until=None, claim=None):
+        """Until a limit resets; a rejection has no end, and its time is when it happened."""
+        self._acct(label).update(blocked_kind=kind, blocked_until=until or time.time(), blocked_claim=claim,
                                  blocked_token=key_hash(token)[:16])  # which token earned it
         self.touch()
-        hint = "; replace its token on the status page" if kind == "auth" else ""
-        log(f"account {label}: {REASONS[kind]}{hint}; back in {until_text(until)}")
+        log(f"account {label}: {REASONS[kind]}; "
+            + (f"back in {until_text(until)}" if until else "replace its token on the status page"))
 
     def served(self, label, dev, model, usage):
         d, a, cost, now = self.devs.setdefault(dev, {"requests": 0}), self._acct(label), api_cost(model, usage), time.time()
@@ -231,9 +233,7 @@ class Pool:
         now, rows, shares = time.time(), [], {w: Counter() for w in WINDOWS}
         for label, token in accounts.items():
             a = self.accounts.get(label, {})
-            # Shown as rejected until replaced or working again, though its block lapses so it's retried.
-            rejected = a.get("blocked_kind") == "auth" and a.get("blocked_token") == key_hash(token)[:16]
-            blocked = rejected or self.blocked(label, token, now)
+            blocked = self.blocked(label, token, now)
             rows.append({
                 "label": label, **{w: used(a, w, now) for w in WINDOWS},
                 **{k: a.get(k) for k in ("usage_at", "requests", "tokens", "cost", *(w + "_reset" for w in WINDOWS))},
@@ -344,7 +344,7 @@ async def proxy(request):
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     error = b""
                 if resp.status == 401 or b"OAuth token has been revoked" in error:  # a revoked token gets a 403
-                    POOL.block(label, token, "auth", time.time() + AUTH_FAIL_COOLDOWN)
+                    POOL.block(label, token, "auth")
                 elif resp.headers.get(UNIFIED + "status") == "rejected":
                     POOL.block(label, token, "limit", reset_time(resp.headers),
                                resp.headers.get(UNIFIED + "representative-claim"))
@@ -409,17 +409,14 @@ async def relay(request, resp, what):
 def all_blocked(tag, accounts):
     """Every account is blocked: answer according to why."""
     blocks = [POOL.accounts.get(label, {}) for label in accounts]
-    kinds = {b.get("blocked_kind") for b in blocks}
-    # A rejected token stays rejected when its block lapses, so it only sets the
-    # reset time when every account is in that state.
-    timed = [b for b in blocks if b.get("blocked_kind") != "auth"] or blocks
-    first = min(timed, key=lambda b: b.get("blocked_until", 0))  # the first back, whose limit is the one named
-    reset = max(first.get("blocked_until", 0), time.time() + 1)
-    log(f"{tag}: all {len(blocks)} accounts blocked ({', '.join(sorted(map(str, kinds)))}); "
-        f"first back in {until_text(reset)}")
-    if kinds == {"auth"}:
+    timed = [b for b in blocks if b.get("blocked_kind") != "auth"]  # a rejected token has no time it's back
+    if not timed:
+        log(f"{tag}: all {len(blocks)} account tokens rejected")
         return api_error(403, "permission_error", "hotpocket: every team account token was "
                          "rejected. Ask your admin to replace them.")
+    first = min(timed, key=lambda b: b.get("blocked_until", 0))  # the first back, whose limit is the one named
+    reset = max(first.get("blocked_until", 0), time.time() + 1)
+    log(f"{tag}: all {len(blocks)} accounts blocked; first back in {until_text(reset)}")
     # Shaped like a subscription usage limit so Claude Code shows its normal
     # "limit reached, resets at ..." message (and can wait for the reset).
     claim = first.get("blocked_claim") or "five_hour"
@@ -456,30 +453,30 @@ def source(request):
 
 @routes.get("/_gateway/events", allow_head=False)  # a HEAD reply ends at the headers, while this would write on
 async def events(request):
-    """Server-sent events: tells an open status page when usage changes, so it refreshes right away."""
+    """Server-sent events: the status page's data as soon as it opens, again when it changes (at most once
+    a second), and every 30 s anyway, for blocks and limits that run out."""
     resp = web.StreamResponse(headers={"content-type": "text/event-stream", "cache-control": "no-store"})
     await resp.prepare(request)
-    wake = POOL.wake
     try:
-        while wake:
+        while wake := POOL.wake:  # the next change, taken before sending so none is missed; None at shutdown
+            await resp.write(f"data: {json.dumps(page_data(request))}\n\n".encode())  # fails once the page is gone
+            await asyncio.sleep(1)
             try:
-                await asyncio.wait_for(wake.wait(), 30)
-            except asyncio.TimeoutError:  # a comment now and then: it fails, ending this, once the page is gone
-                await resp.write(b": idle\n\n")
-                continue
-            wake = POOL.wake  # the next change to wait for (taken before writing, so none is missed); None at shutdown
-            if wake:
-                await resp.write(b"data: changed\n\n")
-    except ConnectionError:  # the page closed
+                await asyncio.wait_for(wake.wait(), 29)
+            except TimeoutError:
+                pass
+    except (ConnectionError, sqlite3.OperationalError):  # the page is gone, or the database busy: it reconnects
         pass
     return resp
 
 
+def page_data(request):
+    return {**POOL.snapshot(load_accounts(), key_names()), "viewer": viewer(request.headers)}
+
+
 @routes.get("/_gateway/status")
 async def status_json(request):
-    snap = POOL.snapshot(load_accounts(), key_names())
-    snap["viewer"] = viewer(request.headers)
-    return web.json_response(snap, dumps=lambda d: json.dumps(d, indent=2))
+    return web.json_response(page_data(request), dumps=lambda d: json.dumps(d, indent=2))
 
 
 @routes.get("/")
