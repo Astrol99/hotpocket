@@ -295,7 +295,7 @@ function accountRow(a) {
     usageCell(a),
     h('td', {class: 'actions admin-only'}, menu(a.label,
       h('button', {onclick: () => replaceToken(a.label)}, icon('key-round'), 'New token'),
-      h('button', {class: 'bad', onclick: e => removeAccount(e.target, a.label)}, icon('trash-2'), 'Remove'))));
+      h('button', {class: 'bad', onclick: e => removeAccount(e.currentTarget, a.label)}, icon('trash-2'), 'Remove'))));
 }
 
 function devRow(d) {
@@ -306,9 +306,9 @@ function devRow(d) {
     h('td', {'data-label': 'Last account'}, d.last_account || '–'),
     // Your own row has "New key" (to set up again or replace a lost key); admins can do it for anyone.
     h('td', {class: 'actions'}, menu(d.name,
-      d.name === snap.viewer.login ? h('button', {onclick: e => newMyKey(e.target)}, icon('key-round'), 'New key')
-        : snap.viewer.admin ? h('button', {onclick: e => makeKey(e.target, d.name, true)}, icon('key-round'), 'New key') : null,
-      snap.viewer.admin ? h('button', {class: 'bad', onclick: e => removeDev(e.target, d.name)}, icon('trash-2'), 'Remove') : null)));
+      d.name === snap.viewer.login ? h('button', {onclick: e => newMyKey(e.currentTarget)}, icon('key-round'), 'New key')
+        : snap.viewer.admin ? h('button', {onclick: e => makeKey(e.currentTarget, d.name, true)}, icon('key-round'), 'New key') : null,
+      snap.viewer.admin ? h('button', {class: 'bad', onclick: e => removeDev(e.currentTarget, d.name)}, icon('trash-2'), 'Remove') : null)));
 }
 
 function accessNote(v) {
@@ -456,9 +456,14 @@ refresh();
 const autoRefresh = () => { if (!document.hidden && !$(':popover-open')) refresh(); };  // not under an open menu
 setInterval(autoRefresh, 15000);
 // The gateway also says when usage changes (a reply finished, an account hit its limit): refresh then,
-// at most once a second. The browser reconnects by itself, say after the gateway restarts.
+// at most once a second. The browser reconnects by itself after a dropped connection, but gives up on an
+// error reply (say a 502 from the proxy while the gateway restarts), so then this starts over.
 let soon = null;
-new EventSource('events').onmessage = () => { soon ??= setTimeout(() => { soon = null; autoRefresh(); }, 1000); };
+(function listen() {
+  const events = new EventSource('events');
+  events.onmessage = () => { soon ??= setTimeout(() => { soon = null; autoRefresh(); }, 1000); };
+  events.onerror = () => { if (events.readyState === EventSource.CLOSED) setTimeout(listen, 5000); };
+})();
 document.addEventListener('visibilitychange', autoRefresh);
 </script>
 </body>

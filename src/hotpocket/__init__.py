@@ -202,13 +202,14 @@ class Pool:
 
     def observe(self, label, headers):
         """Record the account's live usage from the API's response headers."""
-        a = self._acct(label)
+        a, heard = self._acct(label), False
         for window, infix in WINDOWS.items():
             for key, value in ((window, num(headers, f"{UNIFIED}{infix}-utilization")),
                                (window + "_reset", num(headers, f"{UNIFIED}{infix}-reset"))):
                 if value is not None:
-                    a[key], a["usage_at"] = value, time.time()  # when it was last heard
-        self.touch()
+                    a[key], a["usage_at"], heard = value, time.time(), True  # when it was last heard
+        if heard:
+            self.touch()
 
     def block(self, label, token, kind, until, claim=None):
         self._acct(label).update(blocked_kind=kind, blocked_until=until, blocked_claim=claim,
@@ -219,10 +220,11 @@ class Pool:
 
     def served(self, label, dev, model, usage):
         d, a, cost, now = self.devs.setdefault(dev, {"requests": 0}), self._acct(label), api_cost(model, usage), time.time()
+        windows = a.setdefault("spent", {})
         for w in WINDOWS:  # what each developer spent in the account's current windows, to split its use by
-            spent = a.setdefault("spent", {}).get(w)
+            spent = windows.get(w)
             if not spent or (spent["reset"] or 0) <= now:  # that window is over: this request starts the next
-                spent = a["spent"][w] = {"reset": a.get(w + "_reset"), "devs": {}}
+                spent = windows[w] = {"reset": a.get(w + "_reset"), "devs": {}}
             spent["devs"][dev] = spent["devs"].get(dev, 0) + cost
         for entry in (a, d):  # the same tally per account and per developer
             entry["requests"] += 1
@@ -464,11 +466,18 @@ async def events(request):
     resp = web.StreamResponse(headers={"content-type": "text/event-stream", "cache-control": "no-store"})
     await resp.prepare(request)
     wake = POOL.wake
-    while wake:
-        await wake.wait()
-        wake = POOL.wake  # the next change to wait for (taken before writing, so none is missed); None at shutdown
-        if wake:
-            await resp.write(b"data: changed\n\n")
+    try:
+        while wake:
+            try:
+                await asyncio.wait_for(wake.wait(), 30)
+            except asyncio.TimeoutError:  # a comment now and then: it fails, ending this, once the page is gone
+                await resp.write(b": idle\n\n")
+                continue
+            wake = POOL.wake  # the next change to wait for (taken before writing, so none is missed); None at shutdown
+            if wake:
+                await resp.write(b"data: changed\n\n")
+    except ConnectionResetError:  # the page closed
+        pass
     return resp
 
 
@@ -534,6 +543,7 @@ def page_api(role):
                 log(f"refused {request.method} {request.rel_url.raw_path}: database error ({e})")
                 return web.json_response({"error": "The database is busy; try again in a moment."}, status=503)
             log(f"{'admin ' if role == 'admin' else ''}{who['login']}: {done}")
+            POOL.touch()  # other open status pages show the change right away
             return web.json_response(result, headers={"cache-control": "no-store"})  # may hold a new key
         return wrapped
     return wrap
@@ -569,8 +579,7 @@ async def post_key(_request, name):
 async def delete_key(_request, name):
     name = name.lower()
     remove("keys", "name", name, "developer key")
-    if POOL.devs.pop(name, None):  # their history goes with them
-        POOL.touch()
+    POOL.devs.pop(name, None)  # their history goes with them (saved, as every edit touches the pool)
     return f"removed developer {name}", {}
 
 
