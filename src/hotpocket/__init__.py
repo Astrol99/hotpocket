@@ -46,7 +46,7 @@ NAME_RE = re.compile(r"(?!\.+$)[\w.%+@-]{1,254}", re.ASCII)
 TOKEN_RE = re.compile(r"sk-ant-oat[0-9]*-[A-Za-z0-9_-]+")
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
        "trailer", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
-NOT_UPSTREAM = HOP | {"authorization", "x-api-key", "accept-encoding", "anthropic-beta"}
+NOT_UPSTREAM = HOP | {"authorization", "x-api-key", "x-hotpocket-key", "accept-encoding", "anthropic-beta"}
 NOT_DOWNSTREAM = HOP | {"server", "date"}
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -233,8 +233,12 @@ def api_error(status, etype, message, headers=None):
 
 
 def developer(headers):
+    # A developer still logged in to claude.ai (so Artifacts and connectors keep working) sends the key
+    # in its own header, and their own claude.ai token as the bearer, which is dropped. Otherwise the
+    # key is the bearer (or x-api-key).
     auth = headers.get("authorization", "")
-    presented = (auth[7:] if auth.lower().startswith("bearer ") else headers.get("x-api-key", "")).strip()
+    presented = (headers.get("x-hotpocket-key")
+                 or (auth[7:] if auth.lower().startswith("bearer ") else headers.get("x-api-key", ""))).strip()
     if not presented:
         return None
     row = db().execute("SELECT name FROM keys WHERE hash = ?", (key_hash(presented),)).fetchone()

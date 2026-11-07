@@ -163,7 +163,18 @@ async def test_headers_going_up_and_coming_back(gw):
     sent = gw.seen[-1]["headers"]
     assert sent["authorization"] == "Bearer sk-ant-oat01-GOOD"
     assert sent["anthropic-beta"] == "claude-code-20250219,oauth-2025-04-20"
-    assert not {"x-api-key", "tailscale-user-login", "x-forwarded-for"} & {k.lower() for k in sent}
+    assert not {"x-api-key", "x-hotpocket-key", "tailscale-user-login", "x-forwarded-for"} & {k.lower() for k in sent}
+
+
+async def test_key_in_its_own_header_keeps_the_developers_claude_login_out(gw):
+    # Claude Code still logged in to claude.ai sends its own token as the bearer and the key alongside.
+    key = gw.dev["authorization"].removeprefix("Bearer ")
+    headers = dict(gw.dev, authorization="Bearer sk-ant-oat01-ALICES-OWN-LOGIN", **{"x-hotpocket-key": key})
+    assert (await call(gw, headers))[0].status == 200
+    sent = gw.seen[-1]["headers"]
+    assert sent["authorization"] == "Bearer sk-ant-oat01-GOOD" and "x-hotpocket-key" not in sent
+    assert "ALICES-OWN-LOGIN" not in str(dict(sent))  # the developer's own token never reaches upstream
+    assert (await call(gw, dict(headers, **{"x-hotpocket-key": "hp-wrong"})))[0].status == 403
 
 
 async def test_chunked_request_body(gw):

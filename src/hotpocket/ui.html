@@ -94,12 +94,13 @@ body:not(.is-admin) .admin-only{display:none!important}
   <div class="wrap"><table id="developers"></table></div>
   <div id="reveal" class="panel" hidden>
     <h3 id="reveal-title"></h3>
-    <p class="sub">Copy it now: it won't be shown again. Paste this into Claude Code and it sets itself up
-      (the prompt includes the key):</p>
+    <p class="sub">Copy it now: it won't be shown again. Paste this into Claude Code and it sets itself up,
+      keeping your claude.ai login for Artifacts and connectors (the prompt includes the key):</p>
     <pre id="reveal-prompt"></pre>
     <button class="primary" data-copy="reveal-prompt">Copy</button>
-    <p class="sub">Or add this to <code>~/.claude/settings.json</code> yourself (into its <code>env</code> section if
-      it has one), then restart <code>claude</code>:</p>
+    <p class="sub">On a machine where Claude Code isn't logged in to a Claude account, add this to
+      <code>~/.claude/settings.json</code> instead (into its <code>env</code> section if it has one), then restart
+      <code>claude</code>:</p>
     <pre id="reveal-snippet"></pre>
     <button data-copy="reveal-snippet">Copy</button>
     <button id="reveal-done">Done</button>
@@ -333,20 +334,25 @@ const makeKey = (button, name, replacing) =>
       async () => reveal(name, (await api('POST', path('keys', name))).key));
 
 // A prompt that has Claude Code set itself up to use the gateway, and check that it works.
-const setupPrompt = env => `Set up Claude Code to use our team's Claude gateway, hotpocket. In ~/.claude/settings.json \
-(create it if it doesn't exist), add these to the top-level "env" object, keeping everything else in the file:
-${Object.entries(env).map(([k, v]) => `  "${k}": "${v}"`).join(',\n')}
-If that "env" also sets ANTHROPIC_API_KEY, remove it, since it would take priority. Then check it works by running \
-\`claude -p "Reply with OK"\` and tell me what it printed, and that I need to restart Claude Code to switch over.`;
+// A prompt that has Claude Code send its requests through the gateway while staying logged in to
+// claude.ai: the key goes in its own header, so the login (Artifacts, connectors) stays in charge.
+const setupPrompt = (url, key) => `Set up Claude Code to use our team's Claude gateway, hotpocket, while staying \
+logged in to my claude.ai account (so Artifacts and connectors keep working). In ~/.claude/settings.json (create it \
+if it doesn't exist), add these to the top-level "env" object, keeping everything else in the file:
+  "ANTHROPIC_BASE_URL": "${url}",
+  "ANTHROPIC_CUSTOM_HEADERS": "x-hotpocket-key: ${key}"
+If that "env" also sets ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY, remove them: they would replace my login. Then \
+check it works by running \`claude -p "Reply with OK"\` and tell me what it printed, and that I need to restart \
+Claude Code to switch over.`;
 
 // Shows a new key once, as a setup prompt and a settings.json snippet: under "Your key" for your
 // own, under the developers table for one an admin made.
 function reveal(name, key, mine = false) {
   const panel = $('#reveal'), after = mine ? $('#mine') : $('#developers').parentElement;
-  const env = {ANTHROPIC_BASE_URL: location.origin, ANTHROPIC_AUTH_TOKEN: key};
+  const env = {ANTHROPIC_BASE_URL: location.origin, ANTHROPIC_AUTH_TOKEN: key};  // for no claude.ai login
   panel.dataset.name = name;
   $('#reveal-title').textContent = mine ? 'Your new key' : `Key for ${name}`;
-  $('#reveal-prompt').textContent = setupPrompt(env);
+  $('#reveal-prompt').textContent = setupPrompt(location.origin, key);
   $('#reveal-snippet').textContent = JSON.stringify({env}, null, 2);
   panel.querySelectorAll('[data-copy]').forEach(b => { b.textContent = 'Copy'; });
   after.after(panel);

@@ -23,14 +23,15 @@ over Tailscale, at `https://hotpocket.<your-tailnet>.ts.net`.
 
 You need to be on the team's Tailscale network. Open
 `https://hotpocket.<your-tailnet>.ts.net` and click **Get my key**. Paste the prompt
-it shows into Claude Code, which sets itself up and checks the connection (or paste
-the snippet into `~/.claude/settings.json` yourself). Then restart `claude`; remove
-those two settings to go back to your own login.
+it shows into Claude Code, which sets itself up and checks the connection, then
+restart `claude`. Your claude.ai login stays in use for Artifacts and connectors;
+only your requests to Claude go through the gateway. Remove the two settings it
+adds to stop. (No Claude login on that machine? Use the snippet under the prompt.)
 
 - Use the full `.ts.net` name. The short `https://hotpocket` fails the HTTPS
   certificate check, and Claude Code just keeps retrying instead of showing an error.
-- While you use the gateway, Claude Code turns off claude.ai connectors (Slack,
-  Gmail, etc.), because the gateway's key takes priority over your claude.ai login.
+- With the snippet instead of the prompt, the key replaces your claude.ai login, so
+  Claude Code turns off Artifacts and claude.ai connectors (Slack, Gmail, etc.).
 
 ## For the admin
 
