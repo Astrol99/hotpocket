@@ -1,13 +1,4 @@
 __pycache__/
-*.pyc
-.DS_Store
-
-# Never commit credentials
-accounts.json
-keys.json
-state.json
-admins.json
-*.json.migrated
-hotpocket.db*
 .scratch/
-.venv/
+.env
+hotpocket.db*

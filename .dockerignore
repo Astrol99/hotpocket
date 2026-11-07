@@ -1,0 +1,6 @@
+# Only what the image needs (keeps local data and secrets out of the build and image)
+*
+!pyproject.toml
+!uv.lock
+!LICENSE
+!src

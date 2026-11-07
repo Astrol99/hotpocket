@@ -1,0 +1,39 @@
+# hotpocket and the Tailscale node it's reached through. Start or update: docker compose up -d --build
+services:
+  tailscale:
+    image: tailscale/tailscale:v1.104.4
+    environment:
+      TS_HOSTNAME: hotpocket               # the machine name on your tailnet
+      TS_AUTHKEY: ${TS_AUTHKEY:-}          # optional: without one, `docker compose logs tailscale` shows a login link
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /serve.json
+      # Kernel networking, not the default userspace mode: in userspace mode tailscaled hands
+      # tailnet connections for 100.x:8080 to 127.0.0.1:8080, where hotpocket trusts identity
+      # headers, so anyone on the tailnet could claim an admin's login.
+      TS_USERSPACE: "false"
+    devices: [/dev/net/tun]
+    cap_add: [net_admin]
+    configs: [{source: serve, target: /serve.json}]
+    volumes: [tailscale:/var/lib/tailscale]
+    restart: unless-stopped
+  hotpocket:
+    build: .
+    network_mode: service:tailscale        # reachable only through Tailscale serve, at 127.0.0.1:8080
+    depends_on:  # it lives in tailscale's network namespace, which a tailscale restart replaces
+      tailscale: {condition: service_started, restart: true}
+    volumes: [data:/data]
+    logging: {driver: local}               # rotates (a line per request adds up)
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+configs:
+  serve:  # HTTPS for everything; plain HTTP (http://hotpocket/_gateway) only for the read-only status page
+    content: |
+      {"TCP": {"443": {"HTTPS": true}, "80": {"HTTP": true}},
+       "Web": {"$${TS_CERT_DOMAIN}:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8080"}}},
+               "$${TS_CERT_DOMAIN}:80": {"Handlers": {"/_gateway": {"Proxy": "http://127.0.0.1:8080/_gateway"}}}}}
+
+volumes: {tailscale: {}, data: {}}

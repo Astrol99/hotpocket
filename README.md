@@ -8,133 +8,73 @@ limits or accounts.
 > seats or switching accounts to get past usage limits can break your plan's
 > terms. Use this only if Anthropic has approved it for your organization.
 
-- **Routing.** Each request goes to the account with the most headroom. A
-  session stays on its account while that account has room.
+- **Routing.** Each request goes to the account with the most headroom, read live
+  from the API's usage headers. A session stays on its account while it has room.
 - **Usage limits.** When an account hits its limit, the gateway resends the same
-  request on the next account before the developer sees anything. There's no
-  error, restart or "continue".
+  request on the next account before the developer sees anything. If every account
+  is out, Claude Code shows its normal "limit reached" message with the earliest reset.
 - **Tokens.** The account tokens stay on the gateway. Each developer gets their
-  own key, which you can revoke.
-- **Live usage.** The gateway reads each account's usage from the API's response
-  headers, so it always knows how close every account is to its limit.
-- **Everyone limited.** If every account is out, Claude Code shows its normal
-  "limit reached" message with the time of the earliest reset.
+  own key, which can be revoked.
 
-The gateway runs in its own incus container (`hotpocket`) and is reachable
-only over Tailscale at `https://hotpocket.<your-tailnet>.ts.net`.
-
-**Requirements:** an incus host, Tailscale, and one long-lived token per account
-from `claude setup-token`. The gateway is a small Python 3.10+ package built on
-[aiohttp](https://docs.aiohttp.org/), managed with [uv](https://docs.astral.sh/uv/).
-`deploy.sh` installs uv in the container and the exact versions in `uv.lock`.
+It runs with Docker Compose next to its own Tailscale node and is reachable only
+over Tailscale, at `https://hotpocket.<your-tailnet>.ts.net`.
 
 ## For developers
 
 You need to be on the team's Tailscale network. Open
-`https://hotpocket.<your-tailnet>.ts.net/_gateway`, click **Get my key**, and copy
-the snippet it shows into `~/.claude/settings.json` (or ask an admin for a key):
+`https://hotpocket.<your-tailnet>.ts.net/_gateway`, click **Get my key**, and paste
+the snippet it shows into `~/.claude/settings.json`. Then run `claude` as usual;
+remove the snippet to go back to your own login.
 
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "https://hotpocket.<your-tailnet>.ts.net",
-    "ANTHROPIC_AUTH_TOKEN": "hp-..."
-  }
-}
-```
-
-Then run `claude` as usual. To go back to your own login, remove those two lines.
-The key is shown once; if you lose it, click **Replace my key** for a new one (the
-old one stops working).
-
-Use the full `.ts.net` name. The short `https://hotpocket` fails the HTTPS
-certificate check, and Claude Code just keeps retrying instead of showing an error.
-
-While you use the gateway, Claude Code turns off claude.ai connectors (Slack,
-Gmail, etc.), because the gateway's key takes priority over your claude.ai login.
+- Use the full `.ts.net` name. The short `https://hotpocket` fails the HTTPS
+  certificate check, and Claude Code just keeps retrying instead of showing an error.
+- While you use the gateway, Claude Code turns off claude.ai connectors (Slack,
+  Gmail, etc.), because the gateway's key takes priority over your claude.ai login.
 
 ## For the admin
 
-Clone this repo onto the incus host. The commands below run there. From another
-machine, prefix them with `ssh <host>` (and run the deploy as
-`HOST=<host> ./deploy.sh`).
-
-Install or update:
+On a machine with Docker (Compose 2.23 or later), turn on HTTPS certificates for
+your tailnet (Tailscale admin console → DNS), then put an auth key (Settings → Keys)
+in `.env`:
 
 ```sh
-cd hotpocket
-./deploy.sh            # first run creates the container; later runs update the code
+git clone https://github.com/Astrol99/hotpocket && cd hotpocket
+echo TS_AUTHKEY=tskey-auth-... > .env
+docker compose up -d --build        # also how you update: git pull, then this again
+docker compose exec hotpocket hotpocket admin add you@example.com   # your Tailscale login
 ```
 
-The first run ends with two one-time Tailscale commands (log in, then serve the
-gateway over HTTPS). After that, turn off key expiry for the machine in the
-Tailscale admin console.
+Without a key, open the newest link from `docker compose logs -f tailscale`; the
+link changes every minute until it's used. Then, in the Tailscale admin console,
+turn off key expiry for the `hotpocket` machine.
 
-Make yourself an admin, using your Tailscale login (the status page shows it in
-the top corner):
+Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts.net/_gateway`:
 
-```sh
-incus exec hotpocket -- hotpocket admin add you@example.com
-```
+- **Accounts:** paste a token from `claude setup-token` for each Claude account.
+  Saving under an existing label replaces its token, for example a rejected one.
+- **Developer keys:** anyone on your tailnet can get their own. So adding someone
+  to the tailnet (or sharing the machine with them) gives them access, and removing
+  them takes it away. Admins can also make keys for others and revoke any key.
+- Every change is logged with who made it: `docker compose logs -f hotpocket`.
+  An update recreates the container and starts a new log, so save it first if you
+  need the history.
 
-Then do everything else on the status page,
-`https://hotpocket.<your-tailnet>.ts.net/_gateway`:
-
-- **Accounts:** for each one, run `claude setup-token`, open the link it prints in
-  a private browser window signed in to claude.ai as that account, and paste the
-  token into the page. Saving under an existing label replaces its token, for
-  example one the page shows as rejected. Tokens are never shown again.
-- **Developer keys:** anyone signed in to your tailnet can click **Get my key**.
-  The key is named after their Tailscale login, and they can only replace their
-  own. So adding someone to the tailnet (or sharing the hotpocket machine with
-  them) is what gives them access; to keep someone out, remove them from it.
-  Admins can also make keys for others and revoke any key.
-- Every change is logged with who made it:
-  `incus exec hotpocket -- journalctl -u hotpocket -f`.
-
-Managing only works at the full HTTPS address. For a shorter, read-only
-`http://hotpocket/_gateway`, serve just the status page over plain HTTP:
-
-```sh
-incus exec hotpocket -- tailscale serve --bg --http 80 --set-path /_gateway http://127.0.0.1:8080/_gateway
-```
-
-hotpocket learns who you are from Tailscale serve on the same machine: it believes
-the login header on any connection from 127.0.0.1. So Tailscale serve must be the
-only thing forwarding to it there; another reverse proxy, a port forward, or an
-incus proxy device pointed at 127.0.0.1:8080 would let anyone claim an admin's
-login. `hotpocket admin --help` lists the other admin commands.
+Managing works only at the full HTTPS address; `http://hotpocket/_gateway` is a
+read-only view. hotpocket learns who you are from Tailscale serve, which reaches it
+on 127.0.0.1 in the Tailscale container's network, so never publish its port or
+put another proxy in front of it. `hotpocket admin --help` lists the admin commands.
 
 ## Development
 
 ```sh
-uv run pytest                                  # tests
+uv run pytest                                  # tests, against a fake Anthropic API
 HOTPOCKET_DATA=./data uv run hotpocket serve   # run it locally
 ```
 
-The tests run the gateway in-process against a fake Anthropic API, so they need
-no real tokens. Settings are environment variables: `HOTPOCKET_DATA` (default
-`/var/lib/hotpocket`), `HOTPOCKET_HOST` (default `127.0.0.1`) and
-`HOTPOCKET_PORT` (default `8080`).
-
-## Notes
-
-- Tokens from `claude setup-token` last a year. If one is revoked, the gateway
-  skips it, logs `token rejected (401)`, and the status page shows it. Replace
-  it on the page; the new token is used right away.
-- In the Tailscale admin console, turn off key expiry for the `hotpocket`
-  machine so it doesn't drop off the tailnet after 180 days.
-- Files in the container: `/opt/hotpocket/` (code and its `.venv`) and
-  `/var/lib/hotpocket/hotpocket.db`, a SQLite database (`0600`) with the accounts,
-  developer keys (stored only as hashes), admins and saved usage. The service runs
-  as the unprivileged `hotpocket` user, and the `hotpocket` admin command switches
-  to that user when run as root.
-- `deploy.sh` creates the container if needed, copies the code in, and runs
-  `setup.sh` inside it. Every step skips work that is already done, so a failed
-  run can just be run again.
-- `hardening.conf` re-enables `NoNewPrivileges`, `ProtectKernelTunables` and
-  `ProtectControlGroups`, which the incus Ubuntu image turns off for every
-  service by default.
+Settings are environment variables: `HOTPOCKET_DATA` (where `hotpocket.db` lives),
+`HOTPOCKET_HOST` (default `127.0.0.1`) and `HOTPOCKET_PORT` (default `8080`).
+The database holds the accounts, developer keys (stored only as hashes), admins
+and saved usage.
 
 ## License
 

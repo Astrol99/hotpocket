@@ -1,9 +1,5 @@
 """hotpocket: one Claude Code endpoint for the team, backed by a pool of Claude accounts.
 
-Each request goes to the account with the most headroom (a session stays on its
-account while it has room). When an account hits its usage limit, the request is
-retried on the next account before the developer sees anything.
-
 Make yourself an admin (`hotpocket admin add you@example.com`, your Tailscale
 login), then manage accounts and keys on the status page, https://<gateway>/_gateway.
 Developers get their key there too and point Claude Code at the gateway:
@@ -108,9 +104,6 @@ CREATE TABLE IF NOT EXISTS state (name TEXT PRIMARY KEY, value TEXT NOT NULL);  
 def db():
     """This process's connection (creating the database on first use)."""
     DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if os.geteuid() == 0 and DATA.stat().st_uid != 0:
-        # Files root made here (the database, its -wal and -shm) would lock the service out.
-        raise AdminError(f"Run this as the user that owns {DATA}, not root (/usr/local/bin/hotpocket does that).")
     con = sqlite3.connect(DATA / "hotpocket.db", timeout=10)  # waits, rather than fails, while another process writes
     con.execute("PRAGMA journal_mode = WAL")                  # the server reads while the CLI writes
     con.executescript(SCHEMA)
