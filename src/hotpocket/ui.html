@@ -222,22 +222,20 @@ function accountRow(a) {
 function devRow(d) {
   return h('tr', {},
     h('th', {scope: 'row'}, d.name),
-    h('td', {class: d.has_key ? '' : 'dim', 'data-label': 'Key'}, d.has_key ? 'Active' : 'Revoked'),
     h('td', {class: 'num', 'data-label': 'Requests'}, d.requests),
     h('td', {title: clock(d.last_seen), 'data-label': 'Last seen'}, ago(d.last_seen)),
     h('td', {'data-label': 'Last account'}, d.last_account || '–'),
-    h('td', {class: 'actions admin-only'}, d.has_key
-      ? [h('button', {onclick: e => makeKey(e.target, d.name, true)}, 'New key'),
-         h('button', {class: 'bad', onclick: e => revokeKey(e.target, d.name)}, 'Revoke')]
-      : h('button', {onclick: e => makeKey(e.target, d.name, false)}, 'Create key')));
+    h('td', {class: 'actions admin-only'},
+      h('button', {onclick: e => makeKey(e.target, d.name, true)}, 'New key'),
+      h('button', {class: 'bad', onclick: e => removeDev(e.target, d.name)}, 'Remove')));
 }
 
 function accessNote(v) {
   return v.member ? '' : 'Read-only: open this page on Tailscale, at its https://….ts.net address, to get your key.';
 }
 
-// The developer row holding a live key under this name, if any.
-const keyOf = name => snap.developers.find(d => d.name === name && d.has_key);
+// The developer (each one has a key) under this name, if any.
+const keyOf = name => snap.developers.find(d => d.name === name);
 
 // The signed-in visitor's own key: get one, or replace a lost one.
 function renderMine(v) {
@@ -270,7 +268,7 @@ function render() {
                       h('th', {class: 'num', title: 'Active in the last hour'}, 'Sessions'),
                       h('th', {class: 'num'}, 'Requests'), h('th', {class: 'admin-only'})],
         accounts.map(accountRow), 'No accounts yet.');
-  table('#developers', ['Name', 'Key', h('th', {class: 'num'}, 'Requests'), 'Last seen', 'Last account',
+  table('#developers', ['Name', h('th', {class: 'num'}, 'Requests'), 'Last seen', 'Last account',
                         h('th', {class: 'admin-only'})],
         developers.map(devRow), 'No developers yet.');
 }
@@ -303,12 +301,12 @@ const removeAccount = (button, label) =>
   act(button, `Remove the account “${label}”? Requests stop using it right away.`,
       async () => { await api('DELETE', path('accounts', label)); toast(`Removed ${label}.`); });
 
-const revokeKey = (button, name) =>
-  act(button, `Revoke ${name}’s key? It stops working right away. Anyone on the tailnet can still make ` +
+const removeDev = (button, name) =>
+  act(button, `Remove ${name}? Their key stops working right away. Anyone on the tailnet can still make ` +
               'their own key, so to keep someone out, remove them from the tailnet.', async () => {
     await api('DELETE', path('keys', name));
     if ($('#reveal').dataset.name === name) hideReveal();  // don't leave a dead key on screen
-    toast(`Revoked ${name}’s key.`);
+    toast(`Removed ${name}.`);
   });
 
 const makeKey = (button, name, replacing) =>

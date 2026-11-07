@@ -199,8 +199,7 @@ class Pool:
                 **{w: used(a, w, now) for w in WINDOWS}, **{w + "_reset": a.get(w + "_reset") for w in WINDOWS},
                 "requests": a.get("requests", 0), "active_sessions": active[label],
             })
-        names = [*keys, *sorted(self.devs.keys() - keys)]  # key holders, then past developers
-        devs = [{"name": n, "has_key": n in keys, "requests": 0, **self.devs.get(n, {})} for n in names]
+        devs = [{"name": n, "requests": 0, **self.devs.get(n, {})} for n in keys]
         return {"accounts": rows, "available": sum(r["available"] for r in rows), "developers": devs}
 
     def tick(self):
@@ -479,7 +478,9 @@ async def post_key(_request, name):
 async def delete_key(_request, name):
     name = name.lower()
     remove("keys", "name", name, "developer key")
-    return f"removed the key for {name}", {}
+    if POOL.devs.pop(name, None):  # their history goes with them
+        POOL.dirty = True
+    return f"removed developer {name}", {}
 
 
 @routes.post("/_gateway/api/my-key")

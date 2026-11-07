@@ -14,7 +14,7 @@ limits or accounts.
   request on the next account before the developer sees anything. If every account
   is out, Claude Code shows its normal "limit reached" message with the earliest reset.
 - **Tokens.** The account tokens stay on the gateway. Each developer gets their
-  own key, which can be revoked.
+  own key, which an admin can remove.
 
 It runs with Docker Compose next to its own Tailscale node and is reachable only
 over Tailscale, at `https://hotpocket.<your-tailnet>.ts.net`.
@@ -54,7 +54,7 @@ Everything else happens on the status page, `https://hotpocket.<your-tailnet>.ts
   Saving under an existing label replaces its token, for example a rejected one.
 - **Developer keys:** anyone on your tailnet can get their own. So adding someone
   to the tailnet (or sharing the machine with them) gives them access, and removing
-  them takes it away. Admins can also make keys for others and revoke any key.
+  them takes it away. Admins can also make keys for others and remove anyone.
 - Every change is logged with who made it: `docker compose logs -f hotpocket`.
   An update recreates the container and starts a new log, so save it first if you
   need the history.

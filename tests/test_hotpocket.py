@@ -230,7 +230,7 @@ async def test_status_shows_usage_blocks_and_developers_but_no_tokens_and_surviv
     acc = snap["accounts"]
     assert acc["limited"]["blocked_kind"] == "limit" and acc["limited"]["blocked_until"] > time.time() + 7000
     assert acc["good"]["five_hour"] == 0.42 and acc["good"]["requests"] == 1
-    assert [(d["name"], d["has_key"], d["requests"]) for d in snap["developers"]] == [("alice", True, 1)]
+    assert [(d["name"], d["requests"]) for d in snap["developers"]] == [("alice", 1)]
     assert "sk-ant" not in str(snap)
     await gw.close()  # shutting down saves usage
     assert hotpocket.Pool().accounts["limited"]["blocked_until"] > time.time()
@@ -268,14 +268,13 @@ async def test_admin_edits_accounts_and_keys(gw, capsys):
     assert (await call(gw, dev(res["key"], "bob")))[0].status == 200
     assert (await manage(gw, "DELETE", "keys/BOB"))[0] == 200  # names ignore case, like Tailscale logins
     assert (await call(gw, dev(res["key"], "bob")))[0].status == 403
-    devs = {d["name"]: d for d in (await status(gw))["developers"]}
-    assert devs["bob"]["has_key"] is False and devs["bob"]["requests"] == 1
+    assert "bob" not in {d["name"] for d in (await status(gw))["developers"]}  # removed, history and all
     assert (await manage(gw, "DELETE", "accounts/good"))[0] == 200
     assert await manage(gw, "DELETE", "accounts/good") == (400, {"error": "No account named 'good'."})
     log = capsys.readouterr().out
     assert "admin admin@example.com: created a key for bob" in log
     assert "admin admin@example.com: removed account good" in log
-    assert "admin admin@example.com: removed the key for bob" in log  # as stored, not as typed
+    assert "admin admin@example.com: removed developer bob" in log  # as stored, not as typed
 
 
 async def test_members_get_and_replace_only_their_own_key(gw, capsys):
