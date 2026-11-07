@@ -214,11 +214,12 @@ function tile(label, value, sub, use) {
            use == null ? null : bar(use, label), h('div', {class: 'sub'}, sub));
 }
 
+// How much of the whole pool's limit is used: every account's use added up, over all of them. An account
+// with no usage data yet counts as unused, and none counts past its own limit.
 function poolUse(w, label) {
-  const vals = snap.accounts.map(a => a[w]).filter(v => v != null);
-  const avg = vals.length ? sum(vals) / vals.length : null;
-  return tile(label, avg == null ? '–' : pct(avg),
-              vals.length ? `${left(avg)} · average of ${plural(vals.length, 'account')}` : 'no data yet', avg);
+  const n = snap.accounts.length, known = snap.accounts.some(a => a[w] != null);
+  const use = known ? sum(snap.accounts.map(a => Math.min(1, a[w] || 0))) / n : null;
+  return tile(label, known ? pct(use) : '–', known ? `${left(use)} · total of ${plural(n, 'account')}` : 'no data yet', use);
 }
 
 function meterCell(a, w, label) {
