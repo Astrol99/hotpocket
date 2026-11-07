@@ -153,8 +153,6 @@ def key_names():
 
 # --------------------------------------------------------------------------- pool
 
-CHANGED = None  # set (and replaced) whenever usage changes; open status pages wait on it. None when stopped.
-
 # Everything here runs on the event loop's single thread, so no locks are needed.
 
 class Pool:
@@ -164,16 +162,17 @@ class Pool:
         self.accounts = saved.get("accounts", {})  # label -> usage, block and request count
         self.devs = saved.get("devs", {})
         self.sessions = {}                          # session id -> (label, last seen)
+        self.wake = asyncio.Event()  # set (and replaced) on every change; open status pages wait on it
         self.since = saved.get("since") or time.time()  # when token counting started
         self.dirty = False
 
-    def touch(self):
-        """Something the status page shows changed: save it at the next tick, and wake open pages now."""
-        global CHANGED
+    def touch(self, stopping=False):
+        """Something the status page shows changed: save it at the next tick, and wake open pages now.
+        When stopping, they are woken one last time, to close."""
         self.dirty = True
-        if CHANGED:
-            CHANGED.set()
-            CHANGED = asyncio.Event()
+        if self.wake:
+            self.wake.set()
+            self.wake = None if stopping else asyncio.Event()
 
     def _acct(self, label):
         return self.accounts.setdefault(label, {"requests": 0})
@@ -464,10 +463,10 @@ async def events(request):
     """Server-sent events: tells an open status page when usage changes, so it refreshes right away."""
     resp = web.StreamResponse(headers={"content-type": "text/event-stream", "cache-control": "no-store"})
     await resp.prepare(request)
-    wake = CHANGED
+    wake = POOL.wake
     while wake:
         await wake.wait()
-        wake = CHANGED  # the next change to wait for (taken before writing, so none is missed); None at shutdown
+        wake = POOL.wake  # the next change to wait for (taken before writing, so none is missed); None at shutdown
         if wake:
             await resp.write(b"data: changed\n\n")
     return resp
@@ -597,11 +596,11 @@ def make_app():
                 log(f"could not save usage: {e}")
 
     async def lifespan(_app):
-        global POOL, CLIENT, CHANGED
+        global POOL, CLIENT
         # The server never waits long for the database: a stuck writer elsewhere (say an open
         # sqlite3 shell) would otherwise stall every stream. A failed usage save retries next tick.
         db().execute("PRAGMA busy_timeout = 1000")
-        POOL, CHANGED = Pool(), asyncio.Event()
+        POOL = Pool()
         CLIENT = aiohttp.ClientSession(
             auto_decompress=False,  # pass bytes through untouched
             skip_auto_headers=("Accept-Encoding", "User-Agent"),
@@ -619,10 +618,9 @@ def make_app():
     app = web.Application(client_max_size=MAX_BODY)
     app.add_routes(routes)
     app.router.add_route("*", "/{tail:.*}", proxy)  # everything else goes to the API
+
     async def stop_events(_app):  # open status pages would otherwise hold up a restart for its full timeout
-        global CHANGED
-        CHANGED, wake = None, CHANGED
-        wake.set()
+        POOL.touch(stopping=True)
 
     app.cleanup_ctx.append(lifespan)
     app.on_shutdown.append(stop_events)

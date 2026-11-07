@@ -43,11 +43,10 @@ tbody th{font-weight:600}
 .actions{text-align:right}
 .more{padding:5px 8px;border-color:transparent}
 .more .icon{margin:0;vertical-align:middle}
-.more:hover{background:var(--panel)}
 .icon{width:15px;height:15px;margin-right:6px;vertical-align:-3px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .menu{padding:4px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);box-shadow:0 8px 24px rgb(0 0 0/.18);text-align:left}
 .menu button{display:block;width:100%;text-align:left;border:0;background:none;padding:7px 12px}
-.menu button:hover{background:var(--panel)}
+.more:hover,.menu button:hover{background:var(--panel)}
 @supports (position-area:bottom){.menu{inset:auto;margin:4px 0;position-area:bottom span-left;position-try-fallbacks:flip-block}}
 button{font:inherit;font-size:13px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);padding:5px 11px;cursor:pointer}
 button.primary{background:var(--btn);border-color:var(--btn);color:var(--btn-fg);font-size:14px;padding:7px 14px}
@@ -60,7 +59,6 @@ code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;overflow-x:auto;margin:10px 0}
 #reveal-prompt{white-space:pre-wrap}
 .toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--btn);color:var(--btn-fg);padding:8px 14px;border-radius:10px;font-size:14px;max-width:calc(100% - 32px)}
-.dim{color:var(--mute)}
 body:not(.is-admin) .admin-only{display:none!important}
 /* Phones: each row becomes a card with labelled fields. */
 @media (max-width:640px){
@@ -74,7 +72,6 @@ body:not(.is-admin) .admin-only{display:none!important}
   .actions{position:absolute;top:12px;right:0}
   td[data-label]::before{content:attr(data-label);display:block;color:var(--mute);font-size:12px;margin-bottom:2px}
   .num{text-align:left}
-  .actions:empty{display:none}
   .meter{min-width:0}
 }
 </style>
@@ -228,22 +225,23 @@ function tile(label, value, sub, parts) {
 
 // How much of the whole pool's limit is used: every account's use added up, over all of them. An account
 // with no usage data yet counts as unused, and none counts past its own limit.
+const noUsage = w => !snap.accounts.some(a => a[w] != null);
+
 // The pool's use of window w, its bar split by account: each segment is that account's share of the pool's limit.
 function poolUse(w, label) {
-  const n = snap.accounts.length, known = snap.accounts.some(a => a[w] != null);
-  const parts = snap.accounts.map((a, i) => ({v: Math.min(1, a[w] || 0) / n, color: color(i), label: a.label,
-                                              name: `${a.label}: ${pct(Math.min(1, a[w] || 0))} of its limit used`}));
-  const use = known ? sum(parts.map(p => p.v)) : null;
-  return tile(label, known ? pct(use) : '–', known ? left(use) + ' of usage limit total' : 'no data yet', known ? parts : null);
+  if (noUsage(w)) return tile(label, '–', 'no data yet');
+  const parts = snap.accounts.map((a, i) => ({v: Math.min(1, a[w] || 0) / snap.accounts.length, color: color(i),
+    label: a.label, name: `${a.label}: ${pct(Math.min(1, a[w] || 0))} of its limit used`}));
+  const use = sum(parts.map(p => p.v));
+  return tile(label, pct(use), left(use) + ' of usage limit total', parts);
 }
 
 // The same, split by developer: each one's estimated share of the pool's limit (see Pool.snapshot).
 function devUse(w, label) {
-  const known = snap.accounts.some(a => a[w] != null);
-  const parts = snap.developers.map((d, i) => ({v: d[w] || 0, color: color(i), label: d.name,
-                                                name: `${d.name}: ${pct(d[w] || 0)} of the pool's limit`}));
-  const use = known ? sum(parts.map(p => p.v)) : null;
-  return tile(label, known ? pct(use) : '–', known ? 'estimated from what their requests cost' : 'no data yet', known ? parts : null);
+  if (noUsage(w)) return tile(label, '–', 'no data yet');
+  const parts = snap.developers.map((d, i) => ({v: d[w], color: color(i), label: d.name,
+                                                name: `${d.name}: ${pct(d[w])} of the pool's limit`}));
+  return tile(label, pct(sum(parts.map(p => p.v))), 'estimated from what their requests cost', parts);
 }
 
 function meterCell(a, w, label) {
@@ -394,7 +392,6 @@ const makeKey = (button, name, replacing) =>
   act(button, replacing && `Make a new key for ${name}? Their current key stops working.`,
       async () => reveal(name, (await api('POST', path('keys', name))).key));
 
-// A prompt that has Claude Code set itself up to use the gateway, and check that it works.
 // A prompt that has Claude Code send its requests through the gateway while staying logged in to
 // claude.ai: the key goes in its own header, so the login (Artifacts, connectors) stays in charge.
 const setupPrompt = (url, key) => `Set up Claude Code to use our team's Claude gateway, hotpocket, while staying \
