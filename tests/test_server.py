@@ -7,13 +7,7 @@ import sys
 import aiohttp
 import pytest
 
-from hotpocket import server, store
-
-
-def test_keys_are_stored_only_as_hashes(data):
-    key = store.new_key("alice")
-    stored = b"".join(f.read_bytes() for f in data.iterdir())
-    assert key.encode() not in stored and store.key_hash(key).encode() in stored
+from hotpocket import server
 
 
 def test_log_lines_cannot_be_forged():

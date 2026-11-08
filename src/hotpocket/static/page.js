@@ -173,8 +173,9 @@ function devRow(d) {
     usageCell(d),
     h('td', {title: clock(d.last_seen), 'data-label': 'Last seen'}, ago(d.last_seen)),
     h('td', {'data-label': 'Last account'}, d.last_account || '–'),
-    // Your own row has "New key" (to set up again or replace a lost key); admins can do it for anyone.
+    // Your own row shows your key (to set up another device) or makes a new one; admins can make anyone's.
     h('td', {class: 'actions'}, menu(d.name,
+      d.name === snap.viewer.login && h('button', {onclick: e => showMyKey(e.currentTarget)}, icon('eye'), 'Show key'),
       (d.name === snap.viewer.login || snap.viewer.admin) &&
         h('button', {onclick: e => makeKey(e.currentTarget, d.name)}, icon('key-round'), 'New key'),
       snap.viewer.admin && h('button', {class: 'bad', onclick: e => removeDev(e.currentTarget, d.name)}, icon('trash-2'), 'Remove'))));
@@ -188,8 +189,9 @@ function render() {
   document.body.classList.toggle('is-admin', viewer.admin);
   $('#who').textContent = viewer.login ? viewer.login + (viewer.admin ? ' · admin' : '') : '';
   $('#access').hidden = Boolean(viewer.login);
-  // "Get my key" for anyone signed in who has none yet; once they do, their row has "New key".
-  $('#mine-button').hidden = !viewer.login || Boolean(keyOf(viewer.login));
+  // "Get my key" for anyone signed in who has none yet; once they do, "My key" shows it again.
+  $('#mine-button').hidden = !viewer.login;
+  $('#mine-button').textContent = keyOf(viewer.login) ? 'My key' : 'Get my key';
 
   const cost = sum(accounts.map(a => a.cost || 0)), all = sum(accounts.map(a => tokens(a.tokens)));
   $('#tiles').replaceChildren(poolUse('five_hour', '5-hour'), poolUse('seven_day', 'Weekly'),
@@ -237,13 +239,26 @@ const removeDev = (button, name) =>
   });
 
 // A new key for yourself (anyone signed in), or for anyone (admins); asks first when it replaces one.
-function makeKey(button, name) {
+function makeKey(button, name, question) {
   const mine = name === snap.viewer.login;
-  return act(button, keyOf(name) && (mine ? 'Make a new key? Your old one stops working right away.'
-                                          : `Make a new key for ${name}? Their current key stops working.`),
+  question ??= keyOf(name) && (mine ? 'Make a new key? Your old one stops working right away, on every device.'
+                                    : `Make a new key for ${name}? Their current key stops working.`);
+  return act(button, question,
              async () => reveal(name, (await api('POST', mine ? 'my-key' : path('keys', name))).key, mine));
 }
-$('#mine-button').addEventListener('click', e => makeKey(e.target, snap.viewer.login));
+
+// Your key again, to set up another device with it, or a first one. Asks the gateway, not this page's data,
+// which can miss a key just made elsewhere; a key it didn't keep (an old one) can only be replaced.
+function showMyKey(button) {
+  const me = snap.viewer.login;
+  return act(button, null, async () => {
+    const shown = await api('POST', 'my-key/show');
+    await (shown.key ? reveal(me, shown.key, true) : makeKey(button, me, 'key' in shown &&
+      "Your key was made before hotpocket kept keys, so it can't be shown. Make a new one? The old one stops " +
+      'working on every device set up with it.'));
+  });
+}
+$('#mine-button').addEventListener('click', e => showMyKey(e.currentTarget));
 
 // A prompt that has Claude Code send its requests through the gateway while staying logged in to
 // claude.ai: the key goes in its own header, so the login (Artifacts, connectors) stays in charge.
@@ -256,12 +271,14 @@ If that "env" also sets ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY, remove them: 
 check it works by running \`claude -p "Reply with OK"\` and tell me what it printed, and that I need to restart \
 Claude Code to switch over.`;
 
-// Shows a new key once, under the developers table, as a setup prompt and a settings.json snippet.
+// Shows a key under the developers table, as a setup prompt and a settings.json snippet, until closed.
 function reveal(name, key, mine = false) {
   const panel = $('#reveal');
   const env = {ANTHROPIC_BASE_URL: location.origin, ANTHROPIC_AUTH_TOKEN: key};  // for no claude.ai login
   panel.dataset.name = name;
-  $('#reveal-title').textContent = mine ? 'Your new key' : `Key for ${name}`;
+  $('#reveal-title').textContent = mine ? 'Your key' : `Key for ${name}`;
+  $('#reveal-again').textContent = mine ? 'Open it again any time with My key.'
+                                        : `Give it to ${name} privately.`;
   $('#reveal-prompt').textContent = setupPrompt(key);
   $('#reveal-snippet').textContent = JSON.stringify({env}, null, 2);
   panel.querySelectorAll('[data-copy]').forEach(b => { b.textContent = 'Copy'; });
@@ -270,8 +287,14 @@ function reveal(name, key, mine = false) {
 }
 
 document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', async () => {
-  await navigator.clipboard.writeText($('#' + b.dataset.copy).textContent);
-  b.textContent = 'Copied';
+  const pre = $('#' + b.dataset.copy);
+  try {
+    await navigator.clipboard.writeText(pre.textContent);
+    b.textContent = 'Copied';
+  } catch {  // the browser said no: select it instead, for the keyboard shortcut
+    getSelection().selectAllChildren(pre);
+    toast('Selected: press Ctrl+C (⌘C on a Mac) to copy.');
+  }
 }));
 function hideReveal() {
   $('#reveal-prompt').textContent = $('#reveal-snippet').textContent = '';

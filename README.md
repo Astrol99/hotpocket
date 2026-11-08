@@ -24,9 +24,10 @@ over Tailscale, at `https://hotpocket.<your-tailnet>.ts.net`.
 You need to be on the team's Tailscale network. Open
 `https://hotpocket.<your-tailnet>.ts.net` and click **Get my key**. Paste the prompt
 it shows into Claude Code, which sets itself up and checks the connection, then
-restart `claude`. Your claude.ai login stays in use for Artifacts and connectors;
-only your requests to Claude go through the gateway. Remove the two settings it
-adds to stop. No Claude login on that machine? Use the snippet under the prompt; it
+restart `claude`. The same key works on all your devices: to set up another one,
+click **My key** to see the prompt again. Your claude.ai login stays in use for
+Artifacts and connectors; only your requests to Claude go through the gateway.
+Remove the two settings it adds to stop. No Claude login on that machine? Use the snippet under the prompt; it
 replaces the claude.ai login, so Artifacts and claude.ai connectors are off there.
 
 Use the full `.ts.net` name. The short `https://hotpocket` fails the HTTPS
@@ -97,7 +98,7 @@ Settings are environment variables: `HOTPOCKET_DATA` (where `hotpocket.db` lives
 from Claude Code, put it behind
 `tailscale serve --accept-app-caps github.com/astrol99/hotpocket/admin unix:$PWD/data/hotpocket.sock`
 (an absolute path: tailscaled doesn't run in your directory). The database holds
-the accounts, developer keys (stored only as hashes) and saved usage.
+the accounts, developer keys and saved usage.
 
 ## License
 

@@ -8,7 +8,7 @@
 </head>
 <body>
 <!-- Icons: Lucide v1.70.0 (lucide.dev, ISC license), copied unchanged from lucide-static. -->
-<svg hidden><symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol><symbol id="i-key-round" viewBox="0 0 24 24"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/></symbol><symbol id="i-trash-2" viewBox="0 0 24 24"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol><symbol id="i-ellipsis" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol></svg>
+<svg hidden><symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol><symbol id="i-key-round" viewBox="0 0 24 24"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/></symbol><symbol id="i-trash-2" viewBox="0 0 24 24"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol><symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></symbol><symbol id="i-ellipsis" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol></svg>
 <header><h1>hotpocket</h1><span id="who"></span></header>
 <p id="offline" class="note bad" hidden>Can't reach the gateway. Retrying…</p>
 <p id="access" class="note" hidden>Read-only: Tailscale didn't say who you are (a tagged device?). Open this page on your own device to get your key.</p>
@@ -38,8 +38,9 @@
   <div class="wrap"><table id="developers"></table></div>
   <div id="reveal" class="panel" hidden>
     <h3 id="reveal-title"></h3>
-    <p class="sub">Copy it now: it won't be shown again. Paste this into Claude Code and it sets itself up,
-      keeping your claude.ai login for Artifacts and connectors (the prompt includes the key):</p>
+    <p class="sub">The same key works on every device. On each one, paste this into Claude Code and it sets itself
+      up, keeping the claude.ai login for Artifacts and connectors. It includes the key, so keep it private.
+      <span id="reveal-again"></span></p>
     <pre id="reveal-prompt"></pre>
     <button class="primary" data-copy="reveal-prompt">Copy</button>
     <p class="sub">On a machine where Claude Code isn't logged in to a Claude account, add this to
@@ -47,7 +48,7 @@
       <code>claude</code>:</p>
     <pre id="reveal-snippet"></pre>
     <button data-copy="reveal-snippet">Copy</button>
-    <button id="reveal-done">Done</button>
+    <button id="reveal-done">Close</button>
   </div>
   <form id="key-form" class="panel admin-only" autocomplete="off" hidden>
     <h3>Give a developer a key</h3>

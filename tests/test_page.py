@@ -87,6 +87,45 @@ async def test_anyone_gets_and_replaces_only_their_own_key(gw, caplog):
     assert "bob@example.com: created their own key" in caplog.text
 
 
+async def test_anyone_sees_their_own_key_again_and_only_theirs(gw, caplog):
+    _, made = await manage(gw, "POST", "my-key", login="bob@example.com")
+    touched = gw.pool.wake
+    shown = await manage(gw, "POST", "my-key/show", login="Bob@Example.com")
+    assert shown == (200, {"key": made["key"]})  # the same key, for another device
+    assert not touched.is_set()  # a read: open pages aren't sent anything
+    assert (await manage(gw, "POST", "my-key/show", login="bob@example.com", origin="https://evil.example"))[0] == 403
+    assert await manage(gw, "POST", "my-key/show", login="eve@example.com") == (200, {})  # has none yet
+    assert await manage(gw, "POST", "my-key/show") == (200, {})  # an admin sees only their own, and has none
+    _, new = await manage(gw, "POST", "my-key", login="bob@example.com")
+    assert await manage(gw, "POST", "my-key/show", login="bob@example.com") == (200, {"key": new["key"]})
+    assert "bob@example.com: showed their own key" in caplog.text
+
+
+async def test_a_key_from_before_keys_were_kept_works_but_cant_be_shown(gw):
+    store.write("INSERT INTO keys (name, hash, created) VALUES (?, ?, 0)", "old@example.com", store.key_hash("hp-old"))
+    assert (await call(gw, dev("hp-old")))[0].status == 200
+    assert await manage(gw, "POST", "my-key/show", login="old@example.com") == (200, {"key": None})
+
+
+def test_an_old_database_gets_somewhere_to_keep_keys(data):
+    con = sqlite3.connect(data / "hotpocket.db")  # as hotpocket made it before keys were kept
+    con.execute("CREATE TABLE keys (name TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, created REAL NOT NULL)")
+    con.execute("INSERT INTO keys VALUES ('old@example.com', 'abc', 0)")
+    con.commit()
+    con.close()
+    key = store.new_key("new@example.com")
+    assert store.stored_key("new@example.com") == key and store.key_owner(key) == "new@example.com"
+    assert store.stored_key("old@example.com") is None
+
+
+def test_a_key_shown_again_is_always_the_one_that_works(data):
+    store.new_key("bob")
+    store.write("INSERT OR REPLACE INTO keys VALUES ('bob', ?, 0)", store.key_hash("hp-other"))  # an older hotpocket's
+    assert store.stored_key("bob") is None  # not the kept key, which no longer works
+    store.remove_key("bob")
+    assert store.db().execute("SELECT count(*) FROM kept_keys").fetchone() == (0,)  # removed keys aren't kept
+
+
 async def test_locked_database_gives_the_page_a_503(gw):
     store.db().execute("PRAGMA busy_timeout = 50")  # the test needn't wait out the full second
     locker = sqlite3.connect(store.DATA / "hotpocket.db", isolation_level=None)  # say, an open sqlite3 shell

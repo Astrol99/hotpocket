@@ -138,5 +138,5 @@ def as_user(login="admin@example.com", origin="page"):
 async def manage(gw, method, path, body=None, **who):
     """An edit from the status page, by admin@example.com unless `who` says otherwise."""
     resp = await gw.request(method, "/_gateway/api/" + path, json=body, headers=as_user(**who))
-    assert resp.status != 200 or resp.headers["cache-control"] == "no-store"  # may hold a new key
+    assert resp.status != 200 or resp.headers["cache-control"] == "no-store"  # may hold a key
     return resp.status, await resp.json()

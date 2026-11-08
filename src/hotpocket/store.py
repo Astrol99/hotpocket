@@ -1,5 +1,5 @@
 """The database, hotpocket.db in HOTPOCKET_DATA: the pool's accounts and their tokens, the developers'
-keys (only as hashes), and the pool's saved usage. Edits from the status page are checked here."""
+keys, and the pool's saved usage. Edits from the status page are checked here."""
 
 import functools
 import hashlib
@@ -16,8 +16,11 @@ DATA = Path(os.environ.get("HOTPOCKET_DATA", "/data"))
 SCHEMA = """
 -- Accounts are tried in `position` order when their usage is tied.
 CREATE TABLE IF NOT EXISTS accounts (label TEXT PRIMARY KEY, token TEXT NOT NULL, position INTEGER NOT NULL);
--- Only a hash of each developer key is kept; the key itself is shown once and never stored.
+-- Developer keys; requests are matched by the hash.
 CREATE TABLE IF NOT EXISTS keys (name TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, created REAL NOT NULL);
+-- Each key itself, so its owner can set up more devices with it. Apart from `keys` so an older hotpocket still
+-- runs on this database; a key that one makes has no row here, or one that no longer matches its hash.
+CREATE TABLE IF NOT EXISTS kept_keys (name TEXT PRIMARY KEY, key TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS state (name TEXT PRIMARY KEY, value TEXT NOT NULL);    -- the pool's saved usage (JSON)
 """
 
@@ -39,7 +42,11 @@ def db():
     # usage save retries at the next tick.
     con = sqlite3.connect(DATA / "hotpocket.db", timeout=1)
     con.execute("PRAGMA journal_mode = WAL")  # someone reading it in a sqlite3 shell doesn't hold up writes
-    con.executescript(SCHEMA)
+    try:
+        con.executescript(SCHEMA)  # a new table needs the write lock: may fail while locked
+    except sqlite3.Error:
+        con.close()  # not cached, so the next call opens another
+        raise
     return con
 
 
@@ -104,13 +111,28 @@ def remove_account(label):
 
 
 def new_key(name):
-    """A new key for a developer (replacing any they had); only its hash is kept."""
+    """A new key for a developer (replacing any they had)."""
     check_name(name, "Developer")
     key = "hp-" + secrets.token_urlsafe(24)
-    write("INSERT OR REPLACE INTO keys VALUES (?, ?, ?)", name, key_hash(key), time.time())
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO keys VALUES (?, ?, ?)", (name, key_hash(key), time.time()))
+        con.execute("INSERT OR REPLACE INTO kept_keys VALUES (?, ?)", (name, key))
     return key
 
 
-def remove_key(name):
-    if not write("DELETE FROM keys WHERE name = ?", name):  # their history goes at the pool's next tick
+def stored_key(name):
+    """A developer's key, to set up another device; None if it wasn't kept (made before keys were, or by an
+    older hotpocket), so the page never shows a key that doesn't work."""
+    row = db().execute("SELECT hash, key FROM keys LEFT JOIN kept_keys USING (name) WHERE name = ?",
+                       (name,)).fetchone()
+    if not row:
         raise EditError(f"No developer key named '{name}'.")
+    hash_, key = row
+    return key if key and key_hash(key) == hash_ else None
+
+
+def remove_key(name):
+    with db() as con:  # their history goes at the pool's next tick
+        con.execute("DELETE FROM kept_keys WHERE name = ?", (name,))
+        if not con.execute("DELETE FROM keys WHERE name = ?", (name,)).rowcount:
+            raise EditError(f"No developer key named '{name}'.")

@@ -12,7 +12,7 @@ from aiohttp import web
 from .pool import POOL
 from .proxy import api_error
 from .store import (EditError, key_names, load_accounts, new_key, remove_account, remove_key,
-                    save_account)
+                    save_account, stored_key)
 from .tailscale import refused, source, viewer
 
 log = logging.getLogger(__name__)
@@ -78,9 +78,10 @@ ROLES = {"admin": "Only hotpocket admins can do this.",  # why a viewer without 
          "login": "Tailscale didn't say who you are (a tagged device?), so open this page on your own device."}
 
 
-def page_api(role):
+def page_api(role, changes=True):
     """An endpoint the page calls, for a viewer with `role` (a login, or admin). The handler gets the URL's
-    {name} and returns what it did, for the log, and the JSON to answer with."""
+    {name} and returns what it did, for the log, and the JSON to answer with. A read (changes=False) is logged
+    but not pushed to open pages."""
     def wrap(handler):
         async def wrapped(request):
             origin = request.headers.get("origin")
@@ -101,8 +102,9 @@ def page_api(role):
                 refused(request, f"database error ({e})")
                 return api_error(503, "overloaded_error", "The database is busy; try again in a moment.")
             log.info(f"{'admin ' if role == 'admin' else ''}{source(request)}: {done}")
-            request.app[POOL].touch()  # open pages show the change right away
-            return web.json_response(result, headers={"cache-control": "no-store"})  # may hold a new key
+            if changes:
+                request.app[POOL].touch()  # open pages show the change right away
+            return web.json_response(result, headers={"cache-control": "no-store"})  # may hold a key
         return wrapped
     return wrap
 
@@ -145,3 +147,15 @@ async def delete_key(_request, name):
 async def post_my_key(request):
     # Anyone on the tailnet can get (or replace) the key named after their own login, and only that one.
     return "created their own key", {"key": new_key(viewer(request.headers)["login"])}
+
+
+# A POST, like every call here, so the browser sends the Origin that page_api checks.
+@routes.post("/_gateway/api/my-key/show")
+@page_api("login", changes=False)
+async def show_my_key(request):
+    # The same key on every device: anyone can see their own again (only their own), to set up another one.
+    # {} when they have none, so the page makes one without asking even if it hadn't heard of a key.
+    try:
+        return "showed their own key", {"key": stored_key(viewer(request.headers)["login"])}
+    except EditError:
+        return "asked to see their key, but has none", {}
