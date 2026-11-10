@@ -12,6 +12,11 @@ WINDOWS = {"five_hour": "5h", "seven_day": "7d"}  # our name for each limit -> i
 FALLBACK_BLOCK = 3600  # how long a usage-limit rejection without a reset time blocks an account
 # An API key's answers when its credits or spend limit are used up (a 402 billing_error, or these in a 429 or 400).
 OUT_OF_CREDIT = (b"enforced_spend_limit_reached", b"credit balance", b"reached your specified")
+# Each plan's usage limits as a multiple of the Pro plan's, as Anthropic publishes them (support.claude.com). A Team
+# seat's are published per 5-hour session only; its weekly limit is assumed to be the same multiple. The pool's
+# totals weigh accounts by them.
+PLANS = {"team_standard": ("Team Standard", 1.25), "team_premium": ("Team Premium", 6.25),
+         "pro": ("Pro", 1), "max": ("Max", 5), "ultra": ("Ultra", 10)}
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 

@@ -10,7 +10,7 @@ from aiohttp import web
 from humanize import naturaldelta
 
 from .store import is_api_key, key_hash, key_names, load_accounts, save_usage, saved_usage
-from .usage import TOKEN_FIELDS, WINDOWS, api_cost, limits, next_month
+from .usage import PLANS, TOKEN_FIELDS, WINDOWS, api_cost, limits, next_month
 
 log = logging.getLogger(__name__)
 
@@ -144,29 +144,35 @@ class Pool:
 
     # ------------------------------------------------------------------ the status page, and saving
 
-    def snapshot(self, accounts, keys):
-        """What the status page shows about the accounts and the developers (with these keys)."""
+    def snapshot(self, accounts, keys, plans):
+        """What the status page shows about the accounts (with their plans) and the developers (with these keys)."""
         now, rows, shares = time.time(), [], {w: Counter() for w in WINDOWS}
         api = {label for label, token in accounts.items() if is_api_key(token)}  # credits, not seats with limits
-        has = {w: sum(w in windows_of(self.accounts.get(l, {})) for l in accounts if l not in api) for w in WINDOWS}
+        # A plan this version doesn't know (set by a newer hotpocket) counts as unset.
+        plans = {l: p for l, p in plans.items() if p in PLANS}
+        size = {l: PLANS[plans[l]][1] if l in plans else 1 for l in accounts}  # in Pro plans; unset counts as one
+        # The pool's limit for each window: the sizes of the seats that have it.
+        cap = {w: sum(size[l] for l in accounts if l not in api and w in windows_of(self.accounts.get(l, {})))
+               for w in WINDOWS}
         for label, token in accounts.items():
             a = self.accounts.get(label, {})
+            # Its share of the pool's limit in each window it has (none, for API credits).
+            weight = {} if label in api else {w: size[label] / cap[w] for w in windows_of(a)}
             rows.append({
                 "label": label, "api": label in api, "month_cost": used(a, "month_cost", now) or 0, "windows": windows_of(a),
+                "plan": plans.get(label), "size": size[label], "weight": weight,
                 **{w: used(a, w, now) for w in WINDOWS},
                 **{k: a.get(k) for k in ("usage_at", "requests", "tokens", "cost", *(w + "_reset" for w in WINDOWS))},
                 **({"blocked_kind": a["blocked_kind"], "blocked_reason": REASONS[a["blocked_kind"]],
                     "blocked_until": a["blocked_until"]} if self.blocked(label, token, now) else {}),
             })
-            if label in api:
-                continue  # credits aren't part of the seats' limits
             # Developers' shares of the pool's limits: the account's use in its current window, split between
-            # the developers who used it by what their requests would cost at API prices, over the seats with that limit.
-            for w in WINDOWS:
+            # the developers who used it by what their requests would cost at API prices, times its share of the pool's.
+            for w, part in weight.items():
                 spent, use = a.get("spent", {}).get(w), min(1, used(a, w, now) or 0)
                 if spent and (spent["reset"] or 0) > now and (total := sum(spent["devs"].values())):
                     for dev, cost in spent["devs"].items():
-                        shares[w][dev] += use * cost / total / has[w]
+                        shares[w][dev] += use * cost / total * part
         devs = [{"name": n, **self.devs.get(n, {}), **{w: shares[w][n] for w in WINDOWS}} for n in keys]
         return {"accounts": rows, "developers": devs, "since": self.since}
 

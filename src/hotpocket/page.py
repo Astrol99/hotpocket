@@ -11,8 +11,9 @@ from aiohttp import web
 
 from .pool import POOL
 from .proxy import api_error
-from .store import (EditError, key_names, load_accounts, new_key, remove_account, remove_key,
+from .store import (EditError, key_names, load_accounts, load_plans, new_key, remove_account, remove_key,
                     save_account, stored_key)
+from .usage import PLANS
 from .tailscale import refused, source, viewer
 
 log = logging.getLogger(__name__)
@@ -39,8 +40,12 @@ async def page_file(request):
     return web.FileResponse(STATIC / request.match_info["name"], headers={"cache-control": "no-cache"})
 
 
+PLAN_NAMES = {plan: name for plan, (name, _) in PLANS.items()}
+
+
 def page_data(request):
-    return {**request.app[POOL].snapshot(load_accounts(), key_names()), "viewer": viewer(request.headers)}
+    return {**request.app[POOL].snapshot(load_accounts(), key_names(), load_plans()), "viewer": viewer(request.headers),
+            "plans": PLAN_NAMES}
 
 
 @routes.get("/_gateway/status")
@@ -113,11 +118,14 @@ def page_api(role, changes=True):
 @page_api("admin")
 async def put_account(request, name):
     try:
-        token = str((await request.json())["token"])
-    except (ValueError, KeyError, TypeError):
-        raise EditError('Expected a JSON body with "token".') from None
-    save_account(name, token)
-    return f"saved account {name}", {}
+        body = await request.json()
+        token, plan = str(body.get("token") or ""), body.get("plan")
+    except (ValueError, AttributeError):
+        raise EditError('Expected a JSON body with "token" and "plan".') from None
+    if plan is not None:  # left out: the plan stays as it is
+        plan = str(plan)
+    save_account(name, token, plan)
+    return f"saved account {name}" + (f" ({plan})" if plan else ""), {}
 
 
 @routes.delete("/_gateway/api/accounts/{name}")

@@ -75,6 +75,32 @@ async def test_admin_edits_accounts_and_keys(gw, caplog):
     assert "admin admin@example.com: removed developer bob" in log  # as stored, not as typed
 
 
+async def test_admin_sets_a_seats_plan_and_keeps_its_token(gw, caplog):
+    assert await manage(gw, "PUT", "accounts/good", {"plan": "team_premium"}) == (200, {})  # token left blank: kept
+    snap = await status(gw)
+    assert snap["accounts"]["good"]["plan"] == "team_premium" and snap["accounts"]["limited"]["plan"] is None
+    assert store.load_accounts()["good"] == "sk-ant-oat01-GOOD"
+    for body in ({"plan": "gold"}, {"plan": []}):
+        assert (await manage(gw, "PUT", "accounts/good", body))[0] == 400
+    assert (await manage(gw, "PUT", "accounts/new", {"plan": "pro"}))[0] == 400  # a new account needs a token
+    await manage(gw, "PUT", "accounts/good", {"token": TOKEN})  # no plan given: it stays
+    assert store.load_plans() == {"good": "team_premium"}
+    await manage(gw, "PUT", "accounts/good", {"plan": ""})  # "Not set" clears it
+    assert store.load_plans() == {}
+    await manage(gw, "PUT", "accounts/good", {"plan": "ultra"})
+    await manage(gw, "DELETE", "accounts/good")  # its plan goes with it
+    assert store.load_plans() == {}
+    assert "admin admin@example.com: saved account good (team_premium)" in caplog.text
+
+
+async def test_a_plan_this_version_doesnt_know_or_left_behind_is_ignored(gw):
+    store.write("INSERT INTO plans VALUES ('good', 'gold')")  # say, from a newer hotpocket
+    assert (await status(gw))["accounts"]["good"]["plan"] is None  # counted as unset; the page still works
+    store.write("INSERT INTO plans VALUES ('new', 'ultra')")  # an older hotpocket removed 'new' and left its plan
+    store.save_account("new", "sk-ant-oat01-NEW")
+    assert "new" not in store.load_plans()
+
+
 async def test_anyone_gets_and_replaces_only_their_own_key(gw, caplog):
     status_, first = await manage(gw, "POST", "my-key", login="Bob@Example.com")
     assert status_ == 200 and "bob@example.com" in (await status(gw))["developers"]

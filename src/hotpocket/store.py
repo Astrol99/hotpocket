@@ -11,6 +11,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from .usage import PLANS
+
 DATA = Path(os.environ.get("HOTPOCKET_DATA", "/data"))
 
 SCHEMA = """
@@ -21,6 +23,8 @@ CREATE TABLE IF NOT EXISTS keys (name TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQU
 -- Each key itself, so its owner can set up more devices with it. Apart from `keys` so an older hotpocket still
 -- runs on this database; a key that one makes has no row here, or one that no longer matches its hash.
 CREATE TABLE IF NOT EXISTS kept_keys (name TEXT PRIMARY KEY, key TEXT NOT NULL);
+-- Each seat's plan (a key of usage.PLANS), apart from `accounts` for the same reason.
+CREATE TABLE IF NOT EXISTS plans (label TEXT PRIMARY KEY, plan TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS state (name TEXT PRIMARY KEY, value TEXT NOT NULL);    -- the pool's saved usage (JSON)
 """
 
@@ -65,6 +69,11 @@ def load_accounts():
     return dict(db().execute("SELECT label, token FROM accounts ORDER BY position"))
 
 
+def load_plans():
+    """{label: plan} for the accounts whose plan was set."""
+    return dict(db().execute("SELECT label, plan FROM plans"))
+
+
 def key_names():
     return [name for (name,) in db().execute("SELECT name FROM keys ORDER BY created")]
 
@@ -89,14 +98,28 @@ def check_name(name, what):
         raise EditError(f"{what} names are letters, digits and . _ - @ + % (not only dots, at most 254).")
 
 
-def save_account(label, raw_token):
-    """Add an account or replace its token (a replaced account keeps its place)."""
+def save_account(label, raw_token, plan=None):
+    """Add an account, or change one: its token (blank keeps the one it has) and its plan ("" clears it, None leaves
+    it as it is). A changed account keeps its place."""
     check_name(label, "Account")
     token = "".join(raw_token.split())
-    if not TOKEN_RE.fullmatch(token):
+    if token and not TOKEN_RE.fullmatch(token):
         raise EditError("That doesn't look like a Claude Code token or an API key (expected sk-ant-...).")
-    write("INSERT INTO accounts VALUES (?, ?, (SELECT IFNULL(MAX(position), 0) + 1 FROM accounts)) "
-          "ON CONFLICT (label) DO UPDATE SET token = excluded.token", label, token)
+    if plan and plan not in PLANS:
+        raise EditError(f"Plans are {', '.join(PLANS)}.")
+    new = label not in load_accounts()
+    if new and not token:
+        raise EditError("A new account needs a token.")
+    with db() as con:
+        if new:  # not a plan left behind by an account an older hotpocket removed
+            con.execute("DELETE FROM plans WHERE label = ?", (label,))
+        if token:
+            con.execute("INSERT INTO accounts VALUES (?, ?, (SELECT IFNULL(MAX(position), 0) + 1 FROM accounts)) "
+                        "ON CONFLICT (label) DO UPDATE SET token = excluded.token", (label, token))
+        if plan:
+            con.execute("INSERT OR REPLACE INTO plans VALUES (?, ?)", (label, plan))
+        elif plan == "":
+            con.execute("DELETE FROM plans WHERE label = ?", (label,))
 
 
 def is_api_key(token):
@@ -106,8 +129,10 @@ def is_api_key(token):
 
 
 def remove_account(label):
-    if not write("DELETE FROM accounts WHERE label = ?", label):
-        raise EditError(f"No account named '{label}'.")
+    with db() as con:
+        con.execute("DELETE FROM plans WHERE label = ?", (label,))
+        if not con.execute("DELETE FROM accounts WHERE label = ?", (label,)).rowcount:
+            raise EditError(f"No account named '{label}'.")
 
 
 def new_key(name):

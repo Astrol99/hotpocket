@@ -49,6 +49,21 @@ async def test_a_plan_with_only_a_weekly_limit_is_left_out_of_the_5_hour_totals(
     assert alice["seven_day"] == bob["seven_day"] == pytest.approx(0.10 / 2)  # both have a weekly one
 
 
+async def test_accounts_weigh_in_the_pools_limits_by_their_plan(gw):
+    use_accounts("GOOD", "WEEKLY")
+    store.save_account("good", "", "team_premium")  # 6.25x Pro, with a 5-hour and a weekly limit
+    store.save_account("weekly", "", "ultra")  # 10x Pro, weekly only
+    await call(gw)  # alice, on good: 42% of its 5-hour limit, 10% of its weekly
+    await call(gw, dev(store.new_key("bob"), "s2"))  # bob, on weekly: 10% of its weekly
+    snap = await status(gw)
+    assert [snap["accounts"][l]["size"] for l in ("good", "weekly")] == [6.25, 10]
+    assert snap["accounts"]["good"]["weight"] == pytest.approx({"five_hour": 1, "seven_day": 6.25 / 16.25})  # the pool tiles'
+    assert snap["accounts"]["weekly"]["weight"] == pytest.approx({"seven_day": 10 / 16.25})
+    alice, bob = snap["developers"]["alice"], snap["developers"]["bob"]
+    assert alice["five_hour"] == pytest.approx(0.42)  # good is the only seat with a 5-hour limit
+    assert alice["seven_day"] == pytest.approx(0.10 * 6.25 / 16.25) and bob["seven_day"] == pytest.approx(0.10 * 10 / 16.25)
+
+
 async def test_status_shows_usage_blocks_and_developers_but_no_tokens_and_survives_a_restart(gw):
     await call(gw)
     snap = await status(gw)

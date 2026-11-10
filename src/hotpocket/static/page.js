@@ -94,14 +94,13 @@ function tile(label, value, sub, parts) {
 
 const noUsage = w => !snap.accounts.some(a => a[w] != null);
 
-// The pool's use of window w: the use of every seat with that limit (none heard yet counts as unused, and none
-// counts past its own limit) over the number of them, its bar split into each seat's share of the pool's limit.
+// The pool's use of window w: each seat with that limit's use (none heard yet counts as unused, and none counts
+// past its own limit) times its share of the pool's limit (by its plan, see Pool.snapshot), its bar split by seat.
 function poolUse(w, label) {
-  // An API key has credits, not 5-hour and weekly limits, and some plans have only a weekly limit.
-  const seats = snap.accounts.filter(a => !a.api && a.windows.includes(w));
+  const seats = snap.accounts.filter(a => w in a.weight);  // not API keys (credits), nor plans without this limit
   if (!seats.length) return tile(label, '–', 'no account has this limit');
   if (noUsage(w)) return tile(label, '–', 'no data yet');
-  const parts = seats.map((a, i) => ({v: Math.min(1, a[w] || 0) / seats.length, color: color(i),
+  const parts = seats.map((a, i) => ({v: Math.min(1, a[w] || 0) * a.weight[w], color: color(i),
     label: a.label, name: `${a.label}: ${pct(Math.min(1, a[w] || 0))} of its limit used`}));
   const use = sum(parts.map(p => p.v));
   return tile(label, pct(use), pct(Math.max(0, 1 - use)) + ' left of usage limit total', parts);
@@ -139,13 +138,14 @@ function table(id, cols, rows, none) {
     h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', {colspan: cols.length, class: 'sub'}, none))));
 }
 
-// Under an account's label: an API key's credits used this month. A seat's usage is only heard in the API's
-// replies, so it's as old as its last request through hotpocket; use elsewhere (claude.ai, a direct login)
-// doesn't show until then. Say so once it's stale.
+// Under an account's label: an API key's credits used this month, or a seat's plan. A seat's usage is only heard
+// in the API's replies, so it's as old as its last request through hotpocket; use elsewhere (claude.ai, a direct
+// login) doesn't show until then. Say so once it's stale.
 function accountNote(a) {
   if (a.api) return h('div', {class: 'sub'}, `API credits: ${money(a.month_cost)} used this month`);
-  if (!a.usage_at || now() - a.usage_at < 600) return null;
-  return h('div', {class: 'sub', title: clock(a.usage_at)}, 'usage as of ' + ago(a.usage_at));
+  const plan = a.plan ? `${snap.plans[a.plan]} · ${a.size}× Pro` : 'plan not set (counted as 1× Pro)';
+  const stale = a.usage_at && now() - a.usage_at >= 600;
+  return h('div', {class: 'sub', title: stale ? clock(a.usage_at) : ''}, plan + (stale ? ' · usage as of ' + ago(a.usage_at) : ''));
 }
 
 // A Lucide icon from the set in page.html, in the text's color.
@@ -166,7 +166,7 @@ function accountRow(a) {
     h('th', {scope: 'row'}, a.label, accountNote(a)), stateCell(a), meterCell(a, 'five_hour', '5-hour'), meterCell(a, 'seven_day', 'Weekly'),
     usageCell(a),
     h('td', {class: 'actions admin-only'}, menu(a.label,
-      h('button', {onclick: () => replaceToken(a.label)}, icon('key-round'), 'New token'),
+      h('button', {onclick: () => editAccount(a)}, icon('key-round'), 'Edit'),
       h('button', {class: 'bad', onclick: e => removeAccount(e.currentTarget, a.label)}, icon('trash-2'), 'Remove'))));
 }
 
@@ -217,14 +217,15 @@ const path = (kind, name) => `${kind}/${encodeURIComponent(name)}`;
 function toggle(id, open) {
   const f = $('#' + id);
   f.hidden = !(open ?? f.hidden);
-  if (!f.hidden) f.querySelector('input').focus();
+  if (!f.hidden) { f.reset(); f.querySelector('input').focus(); }  // nothing left from an earlier edit
   return f;
 }
 document.querySelectorAll('[data-opens]').forEach(b => b.addEventListener('click', () => toggle(b.dataset.opens)));
 
-function replaceToken(label) {
+function editAccount(a) {
   const f = toggle('account-form', true);
-  f.elements.label.value = label;
+  f.elements.label.value = a.label;
+  f.elements.plan.value = a.plan || '';
   f.elements.token.focus();
   f.scrollIntoView({block: 'center', behavior: 'smooth'});
 }
@@ -305,13 +306,18 @@ function hideReveal() {
 }
 $('#reveal-done').addEventListener('click', hideReveal);
 
+// Saving under an existing label keeps its plan unless it's changed here.
+$('#account-form').elements.label.addEventListener('input', e => {
+  const a = snap?.accounts.find(a => a.label === e.target.value.trim());
+  if (a) e.target.form.elements.plan.value = a.plan || '';
+});
 $('#account-form').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target, label = f.elements.label.value.trim();
-  const replacing = snap.accounts.some(a => a.label === label);
+  const changing = snap.accounts.some(a => a.label === label);
   if (await act(f.querySelector('button'), null, async () => {
-    await api('PUT', path('accounts', label), {token: f.elements.token.value});
-    toast(replacing ? `Replaced the token for ${label}.` : `Added ${label}.`);
+    await api('PUT', path('accounts', label), {token: f.elements.token.value, plan: f.elements.plan.value});
+    toast(changing ? `Saved ${label}.` : `Added ${label}.`);
   })) { f.reset(); f.hidden = true; }
 });
 
@@ -327,7 +333,10 @@ $('#key-form').addEventListener('submit', async e => {
 (function listen() {
   const events = new EventSource('/_gateway/events');
   events.onmessage = e => {
+    const first = !snap;
     snap = JSON.parse(e.data);
+    if (first)  // the account form's plans
+      $('#account-form').elements.plan.append(...Object.entries(snap.plans).map(([key, name]) => h('option', {value: key}, name)));
     $('#offline').hidden = true;
     if (!$(':popover-open')) render();  // not under an open menu
   };
