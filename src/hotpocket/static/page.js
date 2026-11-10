@@ -94,11 +94,13 @@ function tile(label, value, sub, parts) {
 
 const noUsage = w => !snap.accounts.some(a => a[w] != null);
 
-// The pool's use of window w: every seat's use (none heard yet counts as unused, and none counts past its
-// own limit) over the number of seats, its bar split into each seat's share of the pool's limit.
+// The pool's use of window w: the use of every seat with that limit (none heard yet counts as unused, and none
+// counts past its own limit) over the number of them, its bar split into each seat's share of the pool's limit.
 function poolUse(w, label) {
+  // An API key has credits, not 5-hour and weekly limits, and some plans have only a weekly limit.
+  const seats = snap.accounts.filter(a => !a.api && a.windows.includes(w));
+  if (!seats.length) return tile(label, '–', 'no account has this limit');
   if (noUsage(w)) return tile(label, '–', 'no data yet');
-  const seats = snap.accounts.filter(a => !a.api);  // an API key has credits, not 5-hour and weekly limits
   const parts = seats.map((a, i) => ({v: Math.min(1, a[w] || 0) / seats.length, color: color(i),
     label: a.label, name: `${a.label}: ${pct(Math.min(1, a[w] || 0))} of its limit used`}));
   const use = sum(parts.map(p => p.v));
@@ -115,6 +117,7 @@ function devUse(w, label) {
 
 function meterCell(a, w, label) {
   const v = a[w], reset = a[w + '_reset'];
+  if (!a.api && !a.windows.includes(w)) return h('td', {class: 'sub', 'data-label': label}, `no ${label.toLowerCase()} limit`);
   if (v == null) return h('td', {class: 'sub', 'data-label': label}, a.api ? '–' : 'no data yet');
   return h('td', {'data-label': label},
     h('div', {class: 'meter'}, bar([{v}], `${a.label} ${label} use`), h('span', {class: 'pct'}, pct(v))),

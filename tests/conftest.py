@@ -21,7 +21,7 @@ HOST = "hotpocket.example.ts.net"
 async def fake_api(request):
     """Answers by the token's suffix: LIMITED (usage limit), THROTTLE and SLOWDOWN (plain 429s, the
     second with retry-after), GARBLED (a 429 that isn't JSON), BAD (401), REVOKED and NOMODEL (403s),
-    TRUNC (drops mid-stream), SLOW, PLAIN (a reply that isn't streamed); for API keys, SPENT (the monthly spend
+    TRUNC (drops mid-stream), SLOW, PLAIN (a reply that isn't streamed), WEEKLY (a plan with only a weekly limit); for API keys, SPENT (the monthly spend
     cap's 429), BROKE (a 402), LOWBAL and CAPPED (out of credits, or at a set spend limit: 400s) and INVALID
     (a 400 about the request). Others stream a reply with token usage."""
     tok = request.headers.get("authorization", "").rsplit("-", 1)[-1]
@@ -47,7 +47,7 @@ async def fake_api(request):
         return web.json_response({"model": "claude-sonnet-5-5", "usage": {"input_tokens": 1000, "output_tokens": 100}})
     resp = web.StreamResponse(headers={
         "content-type": "text/event-stream", U + "status": "allowed",
-        U + "5h-utilization": "0.42", U + "5h-reset": str(int(now + 3000)),
+        **({} if tok == "WEEKLY" else {U + "5h-utilization": "0.42", U + "5h-reset": str(int(now + 3000))}),
         U + "7d-utilization": "0.10", U + "7d-reset": str(int(now + 90000))})
     await resp.prepare(request)
     usage = '{"input_tokens": 100, "cache_creation_input_tokens": 200, "cache_read_input_tokens": 1000, "output_tokens": 1}'

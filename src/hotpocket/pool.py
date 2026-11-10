@@ -26,6 +26,12 @@ def used(account, period, now):
     return 0 if reset is not None and reset <= now else account.get(period)
 
 
+def windows_of(account):
+    """The limits an account has: the windows its replies report (all of them until it's heard from). Some plans
+    have only a weekly limit."""
+    return [w for w in WINDOWS if w in account or "usage_at" not in account]
+
+
 class Pool:
     def __init__(self):
         saved = saved_usage()
@@ -142,11 +148,11 @@ class Pool:
         """What the status page shows about the accounts and the developers (with these keys)."""
         now, rows, shares = time.time(), [], {w: Counter() for w in WINDOWS}
         api = {label for label, token in accounts.items() if is_api_key(token)}  # credits, not seats with limits
-        seats = len(accounts) - len(api)
+        has = {w: sum(w in windows_of(self.accounts.get(l, {})) for l in accounts if l not in api) for w in WINDOWS}
         for label, token in accounts.items():
             a = self.accounts.get(label, {})
             rows.append({
-                "label": label, "api": label in api, "month_cost": used(a, "month_cost", now) or 0,
+                "label": label, "api": label in api, "month_cost": used(a, "month_cost", now) or 0, "windows": windows_of(a),
                 **{w: used(a, w, now) for w in WINDOWS},
                 **{k: a.get(k) for k in ("usage_at", "requests", "tokens", "cost", *(w + "_reset" for w in WINDOWS))},
                 **({"blocked_kind": a["blocked_kind"], "blocked_reason": REASONS[a["blocked_kind"]],
@@ -155,12 +161,12 @@ class Pool:
             if label in api:
                 continue  # credits aren't part of the seats' limits
             # Developers' shares of the pool's limits: the account's use in its current window, split between
-            # the developers who used it by what their requests would cost at API prices.
+            # the developers who used it by what their requests would cost at API prices, over the seats with that limit.
             for w in WINDOWS:
                 spent, use = a.get("spent", {}).get(w), min(1, used(a, w, now) or 0)
                 if spent and (spent["reset"] or 0) > now and (total := sum(spent["devs"].values())):
                     for dev, cost in spent["devs"].items():
-                        shares[w][dev] += use * cost / total / seats
+                        shares[w][dev] += use * cost / total / has[w]
         devs = [{"name": n, **self.devs.get(n, {}), **{w: shares[w][n] for w in WINDOWS}} for n in keys]
         return {"accounts": rows, "developers": devs, "since": self.since}
 

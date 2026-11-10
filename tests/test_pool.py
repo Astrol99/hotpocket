@@ -37,6 +37,18 @@ async def test_developers_share_the_pool_limits_by_what_their_requests_cost(gw):
     assert devs["alice"]["five_hour"] == devs["bob"]["five_hour"] == pytest.approx(0.42 / 2 / 2)
 
 
+async def test_a_plan_with_only_a_weekly_limit_is_left_out_of_the_5_hour_totals(gw):
+    use_accounts("GOOD", "WEEKLY")
+    assert (await status(gw))["accounts"]["weekly"]["windows"] == ["five_hour", "seven_day"]  # until heard from
+    await call(gw)  # alice, on good: 42% of its 5-hour limit, 10% of its weekly
+    await call(gw, dev(store.new_key("bob"), "s2"))  # bob, on weekly (the one with the most room)
+    snap = await status(gw)
+    assert snap["accounts"]["weekly"]["windows"] == ["seven_day"] and snap["accounts"]["good"]["windows"] == ["five_hour", "seven_day"]
+    alice, bob = snap["developers"]["alice"], snap["developers"]["bob"]
+    assert alice["five_hour"] == pytest.approx(0.42) and not bob["five_hour"]  # good is the only seat with a 5-hour limit
+    assert alice["seven_day"] == bob["seven_day"] == pytest.approx(0.10 / 2)  # both have a weekly one
+
+
 async def test_status_shows_usage_blocks_and_developers_but_no_tokens_and_survives_a_restart(gw):
     await call(gw)
     snap = await status(gw)
