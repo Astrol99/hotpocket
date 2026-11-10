@@ -26,10 +26,11 @@ const until = ts => ts > now() ? 'in ' + span(ts - now()) : 'now';
 const ago = ts => !ts ? 'never' : now() - ts < 60 ? 'just now' : span(now() - ts) + ' ago';
 const clock = ts => ts ? new Date(ts * 1000).toLocaleString([], {weekday: 'short', hour: 'numeric', minute: '2-digit'}) : '';
 const pct = v => Math.round(v * 100) + '%';
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-const count = n => n.toLocaleString('en', {notation: 'compact', maximumFractionDigits: 1});
+const count = n => n.toLocaleString('en', {notation: 'compact', maximumFractionDigits: 1});  // 1.2K, 3.4M
+const plural = (n, word) => `${count(n)} ${word}${n === 1 ? '' : 's'}`;
+// Dollars and cents under $1,000; from there, compact like count: $1.7K, $2.4M.
 const money = v => v.toLocaleString('en', {style: 'currency', currency: 'USD', notation: 'compact',
-                                         minimumFractionDigits: 2, maximumFractionDigits: 2});
+  ...(v < 1000 ? {minimumFractionDigits: 2, maximumFractionDigits: 2} : {maximumFractionDigits: 1})});
 const sum = xs => xs.reduce((x, y) => x + y, 0);
 const tokens = t => sum(Object.values(t || {}));
 
