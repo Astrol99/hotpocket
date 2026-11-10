@@ -6,7 +6,7 @@ import time
 import aiohttp
 import pytest
 
-from hotpocket import store
+from hotpocket import proxy, store
 from hotpocket.usage import UNIFIED as U
 from hotpocket.usage import next_month
 
@@ -230,3 +230,15 @@ async def test_a_rejected_seat_gets_a_try_before_credits(gw):
     block(gw, "GOOD", "auth")
     seen = len(gw.seen)
     assert (await call(gw))[0].status == 200 and toks(gw, seen) == ["GOOD"]
+
+
+@pytest.mark.parametrize("failures, status", [(1, 200), (proxy.CONNECT_TRIES, 502)])
+async def test_a_connection_that_cant_be_made_is_made_again(gw, monkeypatch, caplog, failures, status):
+    real, fails = aiohttp.ClientSession.request, [aiohttp.ConnectionTimeoutError("Connection timeout")] * failures
+    def request(self, method, url, **kw):  # the connection to the API hangs, this many times
+        if str(url).startswith(proxy.UPSTREAM) and fails:
+            raise fails.pop()
+        return real(self, method, url, **kw)
+    monkeypatch.setattr(aiohttp.ClientSession, "request", request)
+    assert (await call(gw))[0].status == status
+    assert caplog.text.count("couldn't connect") == min(failures, proxy.CONNECT_TRIES - 1)

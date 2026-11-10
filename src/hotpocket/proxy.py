@@ -27,6 +27,9 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", 
        "trailer", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
 NOT_UPSTREAM = HOP | {"authorization", "x-api-key", "x-hotpocket-key", "accept-encoding", "anthropic-beta"}
 NOT_DOWNSTREAM = HOP | {"server", "date"}
+# A connection to the API normally takes well under a second. One that hangs is given up on after CONNECT_TIMEOUT
+# and made again, CONNECT_TRIES times in all: safe, since nothing has been sent on it yet.
+CONNECT_TIMEOUT, CONNECT_TRIES = 5, 3
 
 CLIENT = web.AppKey("client", aiohttp.ClientSession)  # the app's HTTP client for the API
 routes = web.RouteTableDef()  # added after the page's: the last one takes every path
@@ -37,7 +40,7 @@ async def client(app):
     back uncompressed, are passed on untouched, and their usage can be read. Cookies are never kept, so
     none ride along from one account or developer to another."""
     async with aiohttp.ClientSession(auto_decompress=False, skip_auto_headers=("Accept-Encoding", "User-Agent"),
-                                     timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=900),
+                                     timeout=aiohttp.ClientTimeout(total=None, sock_connect=CONNECT_TIMEOUT, sock_read=900),
                                      connector=aiohttp.TCPConnector(limit=0),
                                      cookie_jar=aiohttp.DummyCookieJar()) as app[CLIENT]:
         yield
@@ -79,8 +82,7 @@ async def proxy(request):
         tried.append(label)
         token = accounts[label]
         try:
-            resp = await request.app[CLIENT].request(request.method, url, data=body or None, allow_redirects=False,
-                                                     headers=upstream_headers(request.headers, token))
+            resp = await send(request, url, body, token, f"{tag} -> {label}")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning(f"{tag} -> {label}: upstream error {e!r}")
             return api_error(502, "api_error", f"hotpocket: could not reach the Anthropic API ({type(e).__name__}).")
@@ -97,6 +99,18 @@ async def proxy(request):
     if turned:
         return refused_by_all(tag, tried, *turned)
     return all_blocked(pool, tag, accounts)
+
+
+async def send(request, url, body, token, what):
+    """The request, sent to the API with this token; a connection that can't be made is made again."""
+    for attempt in range(1, CONNECT_TRIES + 1):
+        try:
+            return await request.app[CLIENT].request(request.method, url, data=body or None, allow_redirects=False,
+                                                     headers=upstream_headers(request.headers, token))
+        except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError) as e:
+            if attempt == CONNECT_TRIES:
+                raise
+            log.warning(f"{what}: couldn't connect ({e!r}); trying again")
 
 
 def developer(headers):
