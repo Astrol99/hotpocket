@@ -81,16 +81,16 @@ async def proxy(request):
     session = request.headers.get("x-claude-code-session-id") or f"dev:{dev}"
     url = URL(UPSTREAM + request.rel_url.raw_path_qs, encoded=True)  # even "http://host/..." comes as just a path
     tried, turned = [], None
-    while (label := pool.choose(accounts, session, tried)) is not None:
+    while (label := pool.choose(accounts, session, tried, check=request.path == "/v1/messages")) is not None:
         tried.append(label)
-        token = accounts[label]
+        token, sent = accounts[label], time.time()
         try:
             resp = await send(request, url, body, token, f"{tag} -> {label}")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning(f"{tag} -> {label}: upstream error {e!r}")
             return api_error(502, "api_error", f"hotpocket: could not reach the Anthropic API ({type(e).__name__}).")
         async with resp:
-            pool.observe(label, resp.headers)
+            pool.observe(label, resp.headers, sent)
             if resp.status in (401, 403, 429) or (resp.status in (400, 402) and is_api_key(token)):
                 turned = await turned_down(pool, label, token, resp) or turned
                 continue

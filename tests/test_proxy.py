@@ -6,7 +6,7 @@ import time
 import aiohttp
 import pytest
 
-from hotpocket import proxy, store
+from hotpocket import pool, proxy, store
 from hotpocket.usage import UNIFIED as U
 from hotpocket.usage import next_month
 
@@ -251,3 +251,50 @@ async def test_a_connection_that_cant_be_made_is_made_again(gw, monkeypatch, cap
     monkeypatch.setattr(aiohttp.ClientSession, "request", request)
     assert (await call(gw))[0].status == status
     assert caplog.text.count("couldn't connect") == min(failures, proxy.CONNECT_TRIES - 1)
+
+
+async def test_a_seat_at_its_limit_is_checked_now_and_then_in_case_it_was_reset(gw, caplog):
+    use_accounts("RESET", "SPARE")  # both answer: RESET's limit was reset early
+    block(gw, "RESET", "limit", time.time() + 7200)
+    assert (await call(gw))[0].status == 200 and toks(gw) == ["SPARE"]  # just heard it's limited: not checked yet
+    gw.pool.accounts["reset"]["checked_at"] -= pool.RECHECK
+    n = len(gw.seen)  # counting tokens is answered even at the limit, so it can't check one
+    assert (await gw.post("/v1/messages/count_tokens", headers=gw.dev, data=b"{}")).status == 200 and toks(gw, n) == ["SPARE"]
+    n = len(gw.seen)
+    assert (await call(gw))[0].status == 200 and toks(gw, n) == ["RESET"]  # a check goes first, session or not
+    assert "blocked_kind" not in (await status(gw))["accounts"]["reset"]  # back in use
+    assert "account reset: its usage limit was reset; back in use" in caplog.text
+
+
+def test_a_limit_heard_again_isnt_logged_again(gw, caplog):
+    use_accounts("LIMITED")
+    until = time.time() + 7200
+    for _ in range(3):  # say, a check that finds it still at its limit, or requests alongside each other
+        block(gw, "LIMITED", "limit", until)
+    assert caplog.text.count("account limited: usage limit reached") == 1
+
+
+async def test_a_seat_still_at_its_limit_is_blocked_again_and_checked_one_at_a_time(gw):
+    use_accounts("LIMITED", "RESET", "SPARE")
+    block(gw, "LIMITED", "limit", time.time() + 7200)
+    block(gw, "RESET", "limit", time.time() + 7200)
+    store.save_account("credits", "sk-ant-api03-CREDITS")
+    gw.pool.block("credits", "sk-ant-api03-CREDITS", "credit", next_month())
+    for label, at in (("limited", -1), ("reset", 0), ("credits", -2)):  # all long due, the API key longest
+        gw.pool.accounts[label]["checked_at"] = at
+    assert (await call(gw))[0].status == 200 and toks(gw) == ["LIMITED", "SPARE"]  # one check per request
+    acc = (await status(gw))["accounts"]
+    assert acc["limited"]["blocked_kind"] == acc["reset"]["blocked_kind"] == "limit"  # blocked again; RESET not tried
+    n = len(gw.seen)
+    assert (await call(gw))[0].status == 200 and toks(gw, n) == ["RESET"]
+    n = len(gw.seen)
+    await call(gw, {**gw.dev, "x-claude-code-session-id": "s3"})
+    assert toks(gw, n) == ["RESET"]  # LIMITED isn't checked again before RECHECK; credits are never checked
+
+
+def test_a_reply_to_a_request_sent_before_the_limit_doesnt_end_it(gw):
+    use_accounts("LIMITED")
+    sent = time.time() - 1  # a reply that was slow to start, to a request sent just before another hit the limit
+    block(gw, "LIMITED", "limit", time.time() + 7200)
+    gw.pool.observe("limited", {U + "status": "allowed"}, sent)
+    assert gw.pool.accounts["limited"]["blocked_kind"] == "limit"

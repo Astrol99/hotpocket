@@ -10,12 +10,13 @@ from aiohttp import web
 from humanize import naturaldelta
 
 from .store import is_api_key, key_hash, key_names, load_accounts, save_usage, saved_usage
-from .usage import PLANS, TOKEN_FIELDS, WINDOWS, api_cost, limits, next_month
+from .usage import PLANS, TOKEN_FIELDS, UNIFIED, WINDOWS, api_cost, limits, next_month
 
 log = logging.getLogger(__name__)
 
 STICKY_MAX_UTIL = 0.95  # a session moves off its account above this use
 SESSION_TTL = 6 * 3600  # a session not seen for this long is forgotten
+RECHECK = 900  # a seat at its usage limit gets a request this often, in case its limit was reset early
 REASONS = {"auth": "token rejected", "limit": "usage limit reached", "credit": "out of API credits"}  # blocked_kind
 
 
@@ -66,10 +67,18 @@ class Pool:
         return (a.get("blocked_token") == key_hash(token)[:16]
                 and (a.get("blocked_kind") == "auth" or a.get("blocked_until", 0) > now))
 
-    def choose(self, accounts, session, exclude):
+    def choose(self, accounts, session, exclude, check=False):
         """The account for a request's next try (None when there's none left): a seat, its session's while that
-        has room, else the one with the most; API credits only once every seat is blocked."""
+        has room, else the one with the most; API credits only once every seat is blocked. A request that can
+        `check` (a message, which counts toward the limits) may first go to a seat at its limit (see observe)."""
         now, left = time.time(), [l for l in accounts if l not in exclude]
+        if check and not exclude:  # only on a request's first try: one check per request
+            checked = {l: self.accounts[l].get("checked_at", 0) for l in accounts if self.blocked(l, accounts[l], now)
+                       and self.accounts[l]["blocked_kind"] == "limit"}  # only seats get "limit"
+            if due := [l for l, at in checked.items() if now - at >= RECHECK]:
+                label = min(due, key=checked.get)
+                self.accounts[label]["checked_at"] = now
+                return label
 
         def pick(labels):
             ready = [l for l in labels if not self.blocked(l, accounts[l], now)]
@@ -102,18 +111,30 @@ class Pool:
 
     # ------------------------------------------------------------------ what the API said
 
-    def observe(self, label, headers):
-        """Record the account's live usage from a reply's headers."""
+    def observe(self, label, headers, sent):
+        """Record the account's live usage from a reply's headers, and end its usage-limit block if they say it
+        isn't at a limit any more (its limit was reset early)."""
         a = self._acct(label)  # an account that answered is counted (0 requests) even before it serves one
+        # Only a request sent since the block was last heard (a check) can end it: a reply that was slow to start,
+        # to one sent before the limit, says nothing about it now.
+        if (headers.get(UNIFIED + "status", "rejected") != "rejected" and a.get("blocked_kind") == "limit"
+                and a.get("blocked_until", 0) > time.time() and sent >= a.get("checked_at", 0)):
+            a["blocked_kind"], a["blocked_until"] = None, 0
+            log.info(f"account {label}: its usage limit was reset; back in use")
+            self.touch()
         if heard := limits(headers):
             a.update(heard, usage_at=time.time())  # when it was last heard
             self.touch()
 
     def block(self, label, token, kind, until=None, claim=None):
         """Until a limit resets; a rejection has no end, and its time is when it happened."""
-        self._acct(label).update(blocked_kind=kind, blocked_until=until or time.time(), blocked_claim=claim,
-                                 blocked_token=key_hash(token)[:16])  # which token earned it
+        a, token = self._acct(label), key_hash(token)[:16]  # which token earned it
+        again = (a.get("blocked_kind"), a.get("blocked_until"), a.get("blocked_token")) == (kind, until, token)
+        a.update(blocked_kind=kind, blocked_until=until or time.time(), blocked_claim=claim, checked_at=time.time(),
+                 blocked_token=token)
         self.touch()
+        if again:  # a check that found it still blocked, or a request alongside: already logged
+            return
         if until:
             log.info(f"account {label}: {REASONS[kind]}; back in {naturaldelta(until - time.time())}")
         else:
@@ -124,7 +145,8 @@ class Pool:
         a, d, now = self._acct(label), self.devs.setdefault(dev, {"requests": 0}), time.time()
         cost = api_cost(model, usage)
         self.sessions[session] = (label, now)  # where its prompt cache is
-        # It works again, so a rejection is over; a usage limit another request hit meanwhile stays.
+        # It works again, so a rejection is over; a block another request hit meanwhile stays (a seat's limit is
+        # ended by observe, from the reply's headers).
         if a.get("blocked_until", 0) <= now or a.get("blocked_kind") == "auth":
             a["blocked_kind"], a["blocked_until"] = None, 0
         windows = a.setdefault("spent", {})
