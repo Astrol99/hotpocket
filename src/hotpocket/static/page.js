@@ -276,10 +276,10 @@ If that "env" also sets ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY, remove them: 
 check it works by running \`claude -p "Reply with OK"\` and tell me what it printed, and that I need to restart \
 Claude Code to switch over.`;
 
-// Shows a key under the developers table, as a setup prompt and a settings.json snippet, until closed.
+// Shows a key under the developers table, as a setup prompt and the same two settings, until closed.
 function reveal(name, key, mine = false) {
   const panel = $('#reveal');
-  const env = {ANTHROPIC_BASE_URL: location.origin, ANTHROPIC_AUTH_TOKEN: key};  // for no claude.ai login
+  const env = {ANTHROPIC_BASE_URL: location.origin, ANTHROPIC_CUSTOM_HEADERS: `x-hotpocket-key: ${key}`};
   panel.dataset.name = name;
   $('#reveal-title').textContent = mine ? 'Your key' : `Key for ${name}`;
   $('#reveal-again').textContent = mine ? 'Open it again any time with My key.'

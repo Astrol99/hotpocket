@@ -27,8 +27,10 @@ it shows into Claude Code, which sets itself up and checks the connection, then
 restart `claude`. The same key works on all your devices: to set up another one,
 click **My key** to see the prompt again. Your claude.ai login stays in use for
 Artifacts and connectors; only your requests to Claude go through the gateway.
-Remove the two settings it adds to stop. No Claude login on that machine? Use the snippet under the prompt; it
-replaces the claude.ai login, so Artifacts and claude.ai connectors are off there.
+Remove the two settings it adds to stop. No Claude login on that machine? Then
+Claude Code won't start with only the header: use `ANTHROPIC_AUTH_TOKEN` with the key
+in place of `ANTHROPIC_CUSTOM_HEADERS`. That replaces the claude.ai login, so
+Artifacts and claude.ai connectors are off there.
 
 Use the full `.ts.net` name. The short `https://hotpocket` fails the HTTPS
 certificate check, and Claude Code just keeps retrying instead of showing an error.

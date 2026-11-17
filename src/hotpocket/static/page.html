@@ -45,11 +45,13 @@
       <span id="reveal-again"></span></p>
     <pre id="reveal-prompt"></pre>
     <button class="primary" data-copy="reveal-prompt">Copy</button>
-    <p class="sub">On a machine where Claude Code isn't logged in to a Claude account, add this to
-      <code>~/.claude/settings.json</code> instead (into its <code>env</code> section if it has one), then restart
-      <code>claude</code>:</p>
+    <p class="sub">Or add this to <code>~/.claude/settings.json</code> yourself (into its <code>env</code> section if it
+      has one), then restart <code>claude</code>:</p>
     <pre id="reveal-snippet"></pre>
     <button data-copy="reveal-snippet">Copy</button>
+    <p class="sub">Claude Code isn't logged in to a Claude account on that machine? Then it won't start with only
+      the header: use <code>ANTHROPIC_AUTH_TOKEN</code> with the key in place of
+      <code>ANTHROPIC_CUSTOM_HEADERS</code>, which replaces the claude.ai login there.</p>
     <button id="reveal-done">Close</button>
   </div>
   <form id="key-form" class="panel admin-only" autocomplete="off" hidden>
