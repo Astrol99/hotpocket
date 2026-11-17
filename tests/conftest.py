@@ -20,7 +20,7 @@ HOST = "hotpocket.example.ts.net"
 
 async def fake_api(request):
     """Answers by the token's suffix: LIMITED (usage limit), THROTTLE and SLOWDOWN (plain 429s, the
-    second with retry-after), GARBLED (a 429 that isn't JSON), BAD (401), REVOKED and NOMODEL (403s),
+    second with retry-after), GARBLED (a 429 that isn't JSON), BAD (401), REVOKED, NOOAUTH and NOMODEL (403s),
     TRUNC (drops mid-stream), SLOW, PLAIN (a reply that isn't streamed), WEEKLY (a plan with only a weekly limit); for API keys, SPENT (the monthly spend
     cap's 429), BROKE (a 402), LOWBAL and CAPPED (out of credits, or at a set spend limit: 400s) and INVALID
     (a 400 about the request). Others stream a reply with token usage."""
@@ -30,13 +30,14 @@ async def fake_api(request):
     now = time.time()
     status, headers = {"LIMITED": (429, {U + "status": "rejected", U + "reset": str(int(now + 7200))}),
                        "THROTTLE": (429, {}), "SLOWDOWN": (429, {"retry-after": "2", "x-should-retry": "false"}),
-                       "BAD": (401, {}), "REVOKED": (403, {}), "NOMODEL": (403, {}),
+                       "BAD": (401, {}), "REVOKED": (403, {}), "NOOAUTH": (403, {}), "NOMODEL": (403, {}),
                        "SPENT": (429, {}), "BROKE": (402, {}), "LOWBAL": (400, {}), "CAPPED": (400, {}),
                        "INVALID": (400, {})}.get(tok, (200, {}))
     if tok == "GARBLED":
         return web.Response(status=429, text="<html>slow down</html>", content_type="text/html")
     if status != 200:
         message = {"REVOKED": "OAuth token has been revoked.",  # the API's words
+                   "NOOAUTH": "OAuth authentication is currently not allowed for this organization.",
                    "SPENT": "You have reached your API usage limits: your organization has crossed its monthly API usage "
                             "threshold, set based on your organization's API tier.",
                    "LOWBAL": "Your credit balance is too low to access the Anthropic API.",

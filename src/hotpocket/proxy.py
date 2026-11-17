@@ -30,6 +30,9 @@ NOT_DOWNSTREAM = HOP | {"server", "date"}
 # A connection to the API normally takes well under a second. One that hangs is given up on after CONNECT_TIMEOUT
 # and made again, CONNECT_TRIES times in all: safe, since nothing has been sent on it yet.
 CONNECT_TIMEOUT, CONNECT_TRIES = 5, 3
+# A seat's 403s that are about the account, not the request: its token was revoked, or its organization doesn't
+# allow subscription (OAuth) logins. Either one refuses every request, so the account is blocked like a 401.
+REJECTED = (b"OAuth token has been revoked", b"OAuth authentication is currently not allowed")
 
 CLIENT = web.AppKey("client", aiohttp.ClientSession)  # the app's HTTP client for the API
 routes = web.RouteTableDef()  # added after the page's: the last one takes every path
@@ -154,7 +157,7 @@ async def turned_down(pool, label, token, resp):
         error = await resp.read()  # also lets the connection be reused
     except (aiohttp.ClientError, asyncio.TimeoutError):
         error = b""
-    if resp.status == 401 or b"OAuth token has been revoked" in error:  # a revoked token gets a 403
+    if resp.status == 401 or any(s in error for s in REJECTED):
         pool.block(label, token, "auth")
     elif resp.headers.get(UNIFIED + "status") == "rejected":  # a seat's usage limit (API keys have no such header)
         pool.block(label, token, "limit", reset_time(resp.headers), resp.headers.get(UNIFIED + "representative-claim"))

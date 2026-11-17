@@ -143,6 +143,15 @@ async def test_a_429_that_isnt_json_comes_back_as_an_api_error(gw, caplog):
     assert "(429: <html>slow down</html>)" in caplog.text
 
 
+async def test_an_organization_without_oauth_is_blocked_so_credits_take_over_when_the_rest_are_limited(gw):
+    # It refuses every request: left unblocked, it kept counting as a seat that's up, so its 403 went back to
+    # the developer instead of the request going to credits (2026-11-17).
+    use_accounts("NOOAUTH", "LIMITED")
+    store.save_account("credits", "sk-ant-api03-CREDITS")
+    assert (await call(gw))[0].status == 200 and toks(gw) == ["NOOAUTH", "LIMITED", "CREDITS"]
+    assert (await status(gw))["accounts"]["nooauth"]["blocked_kind"] == "auth"
+
+
 async def test_a_revoked_token_is_blocked_and_any_other_403_tries_the_next_account(gw):
     # Anthropic answers a revoked token with a 403, which Claude Code would take for its own login revoked.
     use_accounts("REVOKED", "NOMODEL", "GOOD")
